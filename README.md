@@ -33,9 +33,9 @@ Download and install the release:
 ```sh
 cd /opt/tmp
 wget -O keensteer.tar.gz \
-  https://github.com/mhndt/keensteer/releases/download/v1.0.0/keensteer-1.0.0-mips-3.4.tar.gz
+  https://github.com/mhndt/keensteer/releases/download/v1.0.1/keensteer-1.0.1-mips-3.4.tar.gz
 tar -xzf keensteer.tar.gz
-cd keensteer-1.0.0
+cd keensteer-1.0.1
 ./install.sh
 /opt/sbin/keensteer-setup
 ```
@@ -89,4 +89,4 @@ Issues and pull requests are welcome. Reports from other Keenetic models are esp
 
 GPL-3.0-only. See [LICENSE](LICENSE).
 
-Keenetic is a trademark of its respective owner. This project is independent and is not affiliated with or endorsed by Keenetic.
+Keenetic and MediaTek are trademarks of their respective owners. This project is independent and is not affiliated with or endorsed by either company.
