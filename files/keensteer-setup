@@ -80,7 +80,7 @@ opclass()
 	esac
 }
 
-[ "$(id -u)" -eq 0 ] || die "must run as root"
+[ -n "$root" ] || [ "$(id -u)" -eq 0 ] || die "must run as root"
 [ -x "$ndmc" ] || die "ndmc not found"
 [ -r "$bndstrg" ] || die "$bndstrg not found"
 
