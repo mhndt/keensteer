@@ -324,6 +324,41 @@ static int channel_from_freq(int mhz)
 	return 0;
 }
 
+static int opclass_from_channel(int channel, int current)
+{
+	switch (current) {
+	case 128:
+	case 129:
+		return current;
+	case 83: case 84: case 116: case 117: case 119: case 120:
+	case 122: case 123: case 126: case 127:
+		if (channel >= 1 && channel <= 9) return 83;
+		if (channel >= 10 && channel <= 13) return 84;
+		if (channel == 36 || channel == 44) return 116;
+		if (channel == 40 || channel == 48) return 117;
+		if (channel == 52 || channel == 60) return 119;
+		if (channel == 56 || channel == 64) return 120;
+		if (channel == 100 || channel == 108 || channel == 116 ||
+		    channel == 124 || channel == 132 || channel == 140) return 122;
+		if (channel == 104 || channel == 112 || channel == 120 ||
+		    channel == 128 || channel == 136 || channel == 144) return 123;
+		if (channel == 149 || channel == 157) return 126;
+		if (channel == 153 || channel == 161) return 127;
+		return current;
+	case 81: case 82: case 115: case 118: case 121: case 124: case 125:
+		if (channel == 14) return 82;
+		if (channel >= 1 && channel <= 13) return 81;
+		if (channel >= 36 && channel <= 48) return 115;
+		if (channel >= 52 && channel <= 64) return 118;
+		if (channel >= 100 && channel <= 144) return 121;
+		if (channel >= 149 && channel <= 161) return 124;
+		if (channel == 165) return 125;
+		return current;
+	default:
+		return current;
+	}
+}
+
 static int discover_one(int fd, struct ks_bss *b)
 {
 	struct iwreq wrq;
@@ -350,7 +385,7 @@ static int discover_one(int fd, struct ks_bss *b)
 	memset(essid, 0, sizeof(essid));
 	wrq.u.essid.pointer = essid;
 	wrq.u.essid.length = sizeof(essid) - 1;
-	if (!b->ssid[0] && ioctl(fd, SIOCGIWESSID, &wrq) == 0) {
+	if (ioctl(fd, SIOCGIWESSID, &wrq) == 0) {
 		size_t n = wrq.u.essid.length;
 		if (n > KS_MAX_SSID) n = KS_MAX_SSID;
 		memcpy(b->ssid, essid, n);
@@ -360,19 +395,26 @@ static int discover_one(int fd, struct ks_bss *b)
 	memset(&wrq, 0, sizeof(wrq));
 	memcpy(wrq.ifr_name, b->ifname, strlen(b->ifname) + 1);
 	if (ioctl(fd, SIOCGIWFREQ, &wrq) == 0) {
+		int new_channel = 0, new_freq = 0;
+
 		if (wrq.u.freq.e == 0 && wrq.u.freq.m > 0 && wrq.u.freq.m <= 233) {
-			b->channel = wrq.u.freq.m;
+			new_channel = wrq.u.freq.m;
 		} else if (wrq.u.freq.e >= -3 && wrq.u.freq.e <= 9) {
 			long long hz = wrq.u.freq.m;
 			for (e = wrq.u.freq.e; e > 0; e--) hz *= 10;
 			for (e = wrq.u.freq.e; e < 0; e++) hz /= 10;
-			if (hz > 100000000) b->freq = (int) (hz / 1000000);
+			if (hz > 100000000) new_freq = (int) (hz / 1000000);
+		}
+		if (!new_channel && new_freq) new_channel = channel_from_freq(new_freq);
+		if (new_channel) {
+			b->channel = new_channel;
+			b->freq = new_freq ? new_freq :
+				(new_channel == 14 ? 2484 :
+				 (new_channel <= 14 ? 2407 + 5 * new_channel :
+				  5000 + 5 * new_channel));
+			b->op_class = opclass_from_channel(b->channel, b->op_class);
 		}
 	}
-	if (!b->channel) b->channel = channel_from_freq(b->freq);
-	if (!b->freq && b->channel)
-		b->freq = b->channel == 14 ? 2484 :
-			(b->channel <= 14 ? 2407 + 5 * b->channel : 5000 + 5 * b->channel);
 	if (b->channel >= 1 && b->channel <= 14) b->band = KS_BAND_2GHZ;
 	else if (b->channel >= 30 && b->channel <= 177) b->band = KS_BAND_5GHZ;
 	else b->band = KS_BAND_UNKNOWN;

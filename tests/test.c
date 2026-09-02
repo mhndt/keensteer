@@ -49,6 +49,14 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
 	case SIOCGIWMODE:
 		wrq->u.mode = IW_MODE_MASTER;
 		return 0;
+	case SIOCGIWESSID:
+		memcpy(wrq->u.essid.pointer, "live-ess", 8);
+		wrq->u.essid.length = 8;
+		return 0;
+	case SIOCGIWFREQ:
+		wrq->u.freq.m = 44;
+		wrq->u.freq.e = 0;
+		return 0;
 	case SIOCGIWPRIV:
 		((struct iw_priv_args *) wrq->u.data.pointer)[0].cmd = SIOCIWFIRSTPRIV + 2;
 		wrq->u.data.length = 1;
@@ -298,11 +306,12 @@ static int test_key_expansion(void)
 	fd = mkstemp(path);
 	CHECK(fd >= 0);
 	CHECK(write(fd, "000102030405060708090a0b0c0d0e0f\n", 33) == 33);
-	CHECK(!close(fd) && !chmod(path, 0600));
+	CHECK(!fchmod(fd, 0600));
 	CHECK(!ks_load_rrb_key(path, out, err, sizeof(err)) && !memcmp(out, want, 32));
-	CHECK(!chmod(path, 0644));
+	CHECK(!fchmod(fd, 0644));
 	CHECK(ks_load_rrb_key(path, out, err, sizeof(err)) < 0);
 	CHECK(!unlink(path));
+	CHECK(!close(fd));
 	return 0;
 }
 
@@ -360,7 +369,8 @@ static int test_config(void)
 		memcpy(b->r1kh_id, b->bssid, 6); b->channel = 36; b->freq = 5180;
 		b->op_class = 128; b->band = KS_BAND_5GHZ;
 		mock_wext = true; CHECK(!ks_topology_discover(&s)); mock_wext = false;
-		CHECK(b->active && b->mtk_kdp);
+		CHECK(b->active && b->mtk_kdp && b->channel == 44 &&
+		      !strcmp(b->ssid, "live-ess"));
 	}
 	return 0;
 }

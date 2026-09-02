@@ -117,11 +117,11 @@ for ifname in $(sed -n '3,$p' "$bndstrg"); do
 	done
 	[ -n "$radio" ] || die "cannot match $ifname to a Keenetic access point"
 
-	ssid=$(printf '%s\n' "$ap_output" | sed -n 's/^ssid:[[:space:]]*//p' | head -n 1)
+	ssid=$(printf '%s\n' "$ap_output" | sed -n 's/^[[:space:]]*ssid:[[:space:]]*//p' | head -n 1)
 	channel=$(printf '%s\n' "$master_output" | awk '$1 == "channel:" { print $2; exit }')
 	width=$(printf '%s\n' "$master_output" | awk '$1 == "bandwidth:" { print $2; exit }')
 	[ -n "$ssid" ] || die "cannot read the SSID for $ifname"
-	case "$ssid" in *','*|'#'*) die "SSID contains a character unsupported by keensteer.conf" ;; esac
+	case "$ssid" in *','*|'#'*|*'|'*) die "SSID contains a character unsupported by keensteer.conf" ;; esac
 	case "$channel:$width" in *[!0-9:]*) die "cannot read the channel for $ifname" ;; esac
 	op_class=$(opclass "$channel" "$width") || die "unsupported channel or width on $ifname"
 
@@ -155,35 +155,107 @@ echo "$openwrt_ip" | awk -F. '
 	{ for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || $i > 255) exit 1 }
 ' || die "invalid IPv4 address"
 
-ask "OpenWrt Wi-Fi section" "default_radio1"
-wifi=$answer
-echo "$wifi" | grep -Eq '^[A-Za-z0-9_]+$' || die "invalid UCI section"
+ssh_client=${KEENSTEER_SSH:-}
+[ -n "$ssh_client" ] || ssh_client=$(command -v ssh 2>/dev/null || true)
+[ -n "$ssh_client" ] || die "ssh client not found; use the manual setup"
 
-ask "OpenWrt BSSID" "00:00:00:00:00:00"
-openwrt_bssid=$(printf '%s' "$answer" | tr 'A-F' 'a-f')
-mac_valid "$openwrt_bssid" || die "invalid OpenWrt BSSID"
-[ "$openwrt_bssid" != "00:00:00:00:00:00" ] || die "enter the OpenWrt BSSID"
+probe_script=$root/tmp/keensteer-openwrt-probe.$$
+cat > "$probe_script" <<'EOF'
+#!/bin/sh
+set -eu
+
+[ -r /usr/share/libubox/jshn.sh ] || exit 1
+. /usr/share/libubox/jshn.sh
+
+status=$(ubus call network.wireless status 2>/dev/null)
+json_load "$status"
+json_get_keys radios
+
+for radio in $radios; do
+	json_select "$radio"
+	json_get_var radio_up up
+	if [ "$radio_up" = 1 ]; then
+		json_select interfaces
+		json_get_keys interfaces
+		for entry in $interfaces; do
+			json_select "$entry"
+			json_get_var section section
+			json_get_var ifname ifname
+			json_select config
+			json_get_var mode mode
+			json_get_var ssid ssid
+			json_select ..
+			if [ "$mode" = ap ] && [ -n "$section" ] && [ -n "$ifname" ] &&
+			   [ -r "/sys/class/net/$ifname/address" ]; then
+				bssid=$(tr 'A-F' 'a-f' < "/sys/class/net/$ifname/address")
+				printf '%s|%s|%s|%s\n' "$section" "$ifname" "$ssid" "$bssid"
+			fi
+			json_select ..
+		done
+		json_select ..
+	fi
+	json_select ..
+done
+EOF
+chmod 0600 "$probe_script"
+
+echo
+echo "Discovering OpenWrt access points..."
+if ! probe_output=$("$ssh_client" root@"$openwrt_ip" 'sh -s -- probe' < "$probe_script"); then
+	rm -f "$probe_script"
+	die "cannot read OpenWrt wireless status"
+fi
+rm -f "$probe_script"
+
+openwrt_bss_file=$root/tmp/keensteer-openwrt-bss.$$
+: > "$openwrt_bss_file"
+
+printf '%s\n' "$probe_output" |
+while IFS='|' read -r wifi ifname peer_ssid peer_bssid; do
+	[ -n "$wifi" ] && [ -n "$ifname" ] && [ -n "$peer_ssid" ] &&
+		[ -n "$peer_bssid" ] || continue
+	echo "$wifi" | grep -Eq '^[A-Za-z0-9_-]+$' || continue
+	mac_valid "$peer_bssid" || continue
+	if printf '%s\n' "$bss_lines" | awk -F, -v target="$peer_ssid" '
+		$3 == target { found = 1 }
+		END { exit found ? 0 : 1 }
+	'; then
+		printf '%s|%s|%s|%s\n' "$wifi" "$ifname" "$peer_ssid" "$peer_bssid"
+	fi
+done > "$openwrt_bss_file"
+
+[ -s "$openwrt_bss_file" ] ||
+	die "no enabled OpenWrt access point matches the Keenetic SSID"
 
 ask "Mobility Domain on Keenetic" "KN"
 mdid=$answer
-echo "$mdid" | grep -Eq '^[A-Za-z0-9]{2}$' || die "the Mobility Domain must be two ASCII letters or digits"
+echo "$mdid" | grep -Eq '^[A-Za-z0-9]{2}$' ||
+	die "the Mobility Domain must be two ASCII letters or digits"
 mdid_hex=$(printf '%s' "$mdid" | od -An -tx1 | tr -d ' \n')
-openwrt_r0kh=$(printf '%s' "$openwrt_bssid" | tr -d ':')
 
 echo
 echo "Keenetic access points:"
-printf '%s\n' "$bss_lines" | awk -F, '{ sub(/^bss=/, "", $1); printf "  %-5s %-14s %s channel %s\n", $1, $4, $3, $5 }'
-echo "OpenWrt: $openwrt_ip, $wifi, $openwrt_bssid"
+printf '%s\n' "$bss_lines" |
+	awk -F, '{ sub(/^bss=/, "", $1); printf "  %-5s %-17s %s channel %s\n", $1, $4, $3, $5 }'
+echo "OpenWrt access points:"
+while IFS='|' read -r wifi ifname peer_ssid peer_bssid; do
+	printf '  %-18s %-17s %s\n' "$wifi" "$peer_bssid" "$peer_ssid"
+done < "$openwrt_bss_file"
 echo "Mobility Domain: $mdid on Keenetic, $mdid_hex on OpenWrt"
 printf 'Write this configuration? [y/N]: '
 IFS= read -r answer
-case "$answer" in y|Y|yes|YES) ;; *) exit 0 ;; esac
+case "$answer" in
+	y|Y|yes|YES) ;;
+	*) rm -f "$openwrt_bss_file"; exit 0 ;;
+esac
 
 umask 077
 if [ -e "$key_file" ]; then
 	key_lines=$(awk 'END { print NR }' "$key_file" 2>/dev/null || true)
 	rrb_key=$(sed -n '1p' "$key_file" 2>/dev/null || true)
-	if [ "$key_lines" != 1 ] || ! echo "$rrb_key" | grep -Eq '^([0-9a-fA-F]{32}|[0-9a-fA-F]{64})$'; then
+	if [ "$key_lines" != 1 ] ||
+	   ! echo "$rrb_key" | grep -Eq '^([0-9a-fA-F]{32}|[0-9a-fA-F]{64})$'; then
+		rm -f "$openwrt_bss_file"
 		die "$key_file exists but is not a valid key"
 	fi
 else
@@ -193,38 +265,13 @@ else
 	mv -f "$key_file.new" "$key_file"
 fi
 
-for ap in $ap_paths; do
-	"$ndmc" -c "interface $ap ft enable" >/dev/null
-	"$ndmc" -c "interface $ap ft mdid $mdid" >/dev/null
-done
-"$ndmc" -c 'system configuration save' >/dev/null
-
-tmp_config=$config.$$
-{
-	echo "interface=$transport_if"
-	echo
-	echo "usteer=1"
-	echo "usteer_interval=1000"
-	echo
-	echo "ft=1"
-	echo "rrb_key_file=$key_path"
-	echo
-	printf '%s\n' "$bss_lines"
-	echo "ft_peer=$openwrt_bssid,$openwrt_bssid,$openwrt_ip,$openwrt_bssid,$openwrt_r0kh"
-} > "$tmp_config"
-chmod 0600 "$tmp_config"
-[ ! -e "$config" ] || cp -p "$config" "$config.bak"
-mv -f "$tmp_config" "$config"
-
 cat > "$openwrt_script" <<EOF
 #!/bin/sh
 set -eu
 
-wifi='$wifi'
 listen_ip='$openwrt_ip'
 mobility_domain='$mdid_hex'
 rrb_key='$rrb_key'
-nasid='$openwrt_r0kh'
 
 die()
 {
@@ -234,17 +281,19 @@ die()
 
 replace_entry()
 {
-	option=\$1
-	prefix=\$2
-	value=\$3
+	wifi=\$1
+	option=\$2
+	prefix=\$3
+	value=\$4
 	for old in \$(uci -q get "wireless.\$wifi.\$option" || true); do
-		case "\$old" in "\$prefix"*) uci -q del_list "wireless.\$wifi.\$option=\$old" || true ;; esac
+		case "\$old" in
+			"\$prefix"*) uci -q del_list "wireless.\$wifi.\$option=\$old" || true ;;
+		esac
 	done
 	uci add_list "wireless.\$wifi.\$option=\$value"
 }
 
 [ "\$(id -u)" -eq 0 ] || die "must run as root"
-[ "\$(uci -q get wireless.\$wifi)" = "wifi-iface" ] || die "wireless.\$wifi is not a Wi-Fi interface"
 
 if ! command -v socat >/dev/null 2>&1; then
 	if command -v apk >/dev/null 2>&1; then
@@ -256,22 +305,46 @@ if ! command -v socat >/dev/null 2>&1; then
 	fi
 fi
 command -v socat >/dev/null 2>&1 || die "socat is not installed"
-
-uci set "wireless.\$wifi.ieee80211r=1"
-uci set "wireless.\$wifi.mobility_domain=\$mobility_domain"
-uci set "wireless.\$wifi.ft_over_ds=0"
-uci set "wireless.\$wifi.ft_psk_generate_local=0"
-uci set "wireless.\$wifi.pmk_r1_push=0"
-uci set "wireless.\$wifi.nasid=\$nasid"
-uci set "wireless.\$wifi.r1_key_holder=\$nasid"
 EOF
 
-printf '%s\n' "$openwrt_entries" | while IFS='|' read -r peer_bssid peer_r0kh; do
-	printf 'replace_entry r0kh %s %s\n' \
-		"'$transport_mac,$peer_r0kh,'" "'$transport_mac,$peer_r0kh,$rrb_key'" >> "$openwrt_script"
-	printf 'replace_entry r1kh %s %s\n' \
-		"'$transport_mac,$peer_bssid,'" "'$transport_mac,$peer_bssid,$rrb_key'" >> "$openwrt_script"
-done
+while IFS='|' read -r wifi ifname peer_ssid peer_bssid; do
+	nasid=$(printf '%s' "$peer_bssid" | tr -d ':')
+
+	cat >> "$openwrt_script" <<EOF
+
+[ "\$(uci -q get wireless.$wifi)" = "wifi-iface" ] ||
+	die "wireless.$wifi is not a Wi-Fi interface"
+uci set "wireless.$wifi.ieee80211r=1"
+uci set "wireless.$wifi.mobility_domain=\$mobility_domain"
+uci set "wireless.$wifi.ft_over_ds=0"
+uci set "wireless.$wifi.ft_psk_generate_local=0"
+uci set "wireless.$wifi.pmk_r1_push=0"
+uci set "wireless.$wifi.nasid=$nasid"
+uci set "wireless.$wifi.r1_key_holder=$nasid"
+EOF
+
+	printf '%s\n' "$openwrt_entries" |
+	while IFS='|' read -r keenetic_bssid keenetic_r0kh; do
+		printf "replace_entry '%s' r0kh '%s,%s,' \"%s,%s,\$rrb_key\"\n" \
+			"$wifi" "$transport_mac" "$keenetic_r0kh" \
+			"$transport_mac" "$keenetic_r0kh" >> "$openwrt_script"
+		printf "replace_entry '%s' r1kh '%s,%s,' \"%s,%s,\$rrb_key\"\n" \
+			"$wifi" "$transport_mac" "$keenetic_bssid" \
+			"$transport_mac" "$keenetic_bssid" >> "$openwrt_script"
+	done
+
+	while IFS='|' read -r other_wifi other_ifname other_ssid other_bssid; do
+		[ "$other_bssid" = "$peer_bssid" ] && continue
+		other_nasid=$(printf '%s' "$other_bssid" | tr -d ':')
+
+		printf "replace_entry '%s' r0kh '%s,%s,' \"%s,%s,\$rrb_key\"\n" \
+			"$wifi" "$other_bssid" "$other_nasid" \
+			"$other_bssid" "$other_nasid" >> "$openwrt_script"
+		printf "replace_entry '%s' r1kh '%s,%s,' \"%s,%s,\$rrb_key\"\n" \
+			"$wifi" "$other_bssid" "$other_bssid" \
+			"$other_bssid" "$other_bssid" >> "$openwrt_script"
+	done < "$openwrt_bss_file"
+done < "$openwrt_bss_file"
 
 cat >> "$openwrt_script" <<'EOF'
 
@@ -293,29 +366,74 @@ start_service()
 	procd_close_instance
 }
 INIT
+
 chmod 0755 "$tmp"
 mv -f "$tmp" /etc/init.d/keensteer-rrb-sink
 /etc/init.d/keensteer-rrb-sink enable
 /etc/init.d/keensteer-rrb-sink restart
 
-echo "Configured wireless.$wifi for keensteer."
-echo "Started TCP/3517 listener on $listen_ip."
+echo "Configured OpenWrt for keensteer."
 EOF
 
 chmod 0600 "$openwrt_script"
+
+echo
+echo "Configuring OpenWrt over SSH..."
+if ! "$ssh_client" root@"$openwrt_ip" 'sh -s -- apply' < "$openwrt_script"; then
+	rm -f "$openwrt_bss_file"
+	unset rrb_key
+	die "OpenWrt setup failed"
+fi
+
+ft_peer_lines=
+peer_count=0
+
+while IFS='|' read -r wifi ifname peer_ssid peer_bssid; do
+	peer_r0kh=$(printf '%s' "$peer_bssid" | tr -d ':')
+	line="ft_peer=$peer_bssid,$peer_bssid,$openwrt_ip,$peer_bssid,$peer_r0kh"
+
+	if [ -n "$ft_peer_lines" ]; then
+		ft_peer_lines="$ft_peer_lines
+$line"
+	else
+		ft_peer_lines=$line
+	fi
+
+	peer_count=$((peer_count + 1))
+	[ "$peer_count" -le 16 ] || die "too many OpenWrt access points"
+done < "$openwrt_bss_file"
+
+rm -f "$openwrt_bss_file"
+
+for ap in $ap_paths; do
+	"$ndmc" -c "interface $ap ft enable" >/dev/null
+	"$ndmc" -c "interface $ap ft mdid $mdid" >/dev/null
+done
+
+"$ndmc" -c 'system configuration save' >/dev/null
+
+tmp_config=$config.$$
+{
+	echo "interface=$transport_if"
+	echo
+	echo "usteer=1"
+	echo "usteer_interval=1000"
+	echo
+	echo "ft=1"
+	echo "rrb_key_file=$key_path"
+	echo
+	printf '%s\n' "$bss_lines"
+	printf '%s\n' "$ft_peer_lines"
+} > "$tmp_config"
+
+chmod 0600 "$tmp_config"
+[ ! -e "$config" ] || cp -p "$config" "$config.bak"
+mv -f "$tmp_config" "$config"
 unset rrb_key
 
 echo
 echo "Wrote $config"
-echo "Prepared $openwrt_script"
+echo "Configured OpenWrt at $openwrt_ip"
 echo
-ssh_client=$(command -v ssh 2>/dev/null || true)
-if [ -n "$ssh_client" ]; then
-	echo "Run the OpenWrt setup over SSH:"
-	echo "  $ssh_client root@$openwrt_ip 'sh -s' < $openwrt_script"
-else
-	echo "Copy $openwrt_script to the OpenWrt AP and run it with sh."
-fi
-echo
-echo "Then start keensteer:"
+echo "Start keensteer:"
 echo "  /opt/etc/init.d/S99keensteer restart"

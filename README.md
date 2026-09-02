@@ -10,13 +10,13 @@ It runs on the Keenetic as a small translation layer between Keenetic's roaming 
 
 On OpenWrt:
 
-- usteer or [usteer-ng](https://github.com/NilsRo/usteer-ng).
-- A wpad package with WPA3/SAE and 802.11r support, such as wpad-basic-openssl.
-- The same SSID and security settings as the Keenetic AP.
+- usteer or [usteer-ng](https://github.com/NilsRo/usteer-ng)
+- A wpad package with WPA3/SAE and 802.11r support, such as wpad-basic-openssl
+- The same SSID and security settings as the Keenetic AP
 
 On Keenetic:
 
-- [Entware](https://support.keenetic.com/hero-dsl/kn-2410/en/20980-installing-the-entware-repository-on-a-usb-drive.html).
+- [Entware](https://support.keenetic.com/hero-dsl/kn-2410/en/20980-installing-the-entware-repository-on-a-usb-drive.html)
 
 ## Install
 
@@ -42,7 +42,7 @@ cd keensteer-1.0.0
 
 The installer puts keensteer under /opt. Existing configuration and keys are left alone when upgrading.
 
-The setup helper discovers the Keenetic radios, writes the keensteer configuration and prepares the matching OpenWrt setup. See [SETUP.md](SETUP.md) for the guided and manual setup paths.
+The setup helper discovers the Keenetic radios, configures every matching OpenWrt access point over SSH and writes the keensteer configuration. See [SETUP.md](SETUP.md) for the guided and manual setup paths.
 
 # Usage
 

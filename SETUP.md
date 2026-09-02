@@ -13,40 +13,14 @@ Install keensteer on the Keenetic, then run:
 /opt/sbin/keensteer-setup
 ```
 
-The helper discovers the active Keenetic radios and asks for three OpenWrt values:
+The helper discovers the active Keenetic radios and asks for the OpenWrt IPv4 address and Mobility Domain.
 
-- IPv4 address, such as 192.0.2.20
-- Wi-Fi section, such as default_radio1
-- BSSID of the OpenWrt Wi-Fi network
+It connects to OpenWrt over SSH, finds every enabled access point using the same SSID and configures all matching 2.4 GHz and 5 GHz interfaces for 802.11r. OpenWrt radios using other SSIDs are left alone.
 
-The BSSID is shown in LuCI under **Network → Wireless**. To list the Wi-Fi sections over SSH:
+The helper preserves an existing key or generates a new one, configures the matching R0KH and R1KH entries on OpenWrt, installs the TCP/3517 listener and writes /opt/etc/keensteer.conf.
 
-```sh
-uci show wireless | grep '=wifi-iface'
-```
+Root SSH access from the Keenetic to OpenWrt is required for guided setup. Use the manual setup below if SSH is unavailable.
 
-The helper enables FT on the Keenetic, preserves an existing key or generates a new one, writes /opt/etc/keensteer.conf and prepares /tmp/keensteer-openwrt.sh.
-
-It prints the exact SSH command needed to run the OpenWrt half. It will look like:
-
-```sh
-/opt/bin/ssh root@192.0.2.20 'sh -s' < /tmp/keensteer-openwrt.sh
-```
-
-The OpenWrt script:
-
-- configures the selected Wi-Fi section for 802.11r
-- adds the matching R0KH and R1KH entries
-- installs socat if needed
-- installs and enables a supervised TCP/3517 listener
-
-When it finishes, start keensteer:
-
-```sh
-/opt/etc/init.d/S99keensteer restart
-```
-
-If the Keenetic does not have an SSH client, copy /tmp/keensteer-openwrt.sh to the OpenWrt AP and run it there with sh.
 
 # Manual setup
 
