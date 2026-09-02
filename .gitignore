@@ -1,0 +1,13 @@
+/build/
+/keensteerd
+*.o
+*.log
+*.pcap
+*.pcapng
+*.pre-*
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+/files/keensteer.local.conf
+/files/*.rrb.key

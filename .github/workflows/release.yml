@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Check version
+        run: |
+          header_version=$(sed -n 's/^#define KS_VERSION "\([^"]*\)"/\1/p' include/keensteer.h)
+          make_version=$(sed -n 's/^VERSION[[:space:]]*=[[:space:]]*//p' Makefile)
+          test "$header_version" = "$make_version"
+          test "v$header_version" = "$GITHUB_REF_NAME"
+      - run: make test
+      - name: Check shell scripts
+        run: |
+          for script in install.sh uninstall.sh files/S99keensteer files/keensteer-setup tests/test-setup.sh; do
+            dash -n "$script"
+          done
+
+  mips:
+    runs-on: ubuntu-latest
+    container:
+      image: waujito/entware_builder:mips-3.4
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build mips-3.4 release
+        working-directory: /home/me/Entware
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          src=$GITHUB_WORKSPACE
+
+          mkdir -p package/keensteer
+          cat > package/keensteer/Makefile <<'MAKEFILE'
+          include $(TOPDIR)/rules.mk
+
+          PKG_NAME:=keensteer
+          PKG_VERSION:=$(KEENSTEER_VERSION)
+          PKG_RELEASE:=1
+          PKG_LICENSE:=GPL-3.0-only
+          PKG_LICENSE_FILES:=LICENSE
+          PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
+
+          include $(INCLUDE_DIR)/package.mk
+
+          define Package/keensteer
+          	SECTION:=net
+          	CATEGORY:=Network
+          	TITLE:=Keenetic/OpenWrt roaming interoperability daemon
+          	DEPENDS:=+libopenssl
+          endef
+
+          define Build/Prepare
+          	rm -rf $(PKG_BUILD_DIR)
+          	mkdir -p $(PKG_BUILD_DIR)
+          	cp -a $(KEENSTEER_SRC)/. $(PKG_BUILD_DIR)/
+          endef
+
+          define Build/Compile
+          	$(MAKE) -C $(PKG_BUILD_DIR) \
+          		CC="$(TARGET_CC)" \
+          		CPPFLAGS="$(TARGET_CPPFLAGS) -I$(STAGING_DIR)/opt/include -I$(PKG_BUILD_DIR)/include" \
+          		CFLAGS="$(TARGET_CFLAGS)" \
+          		LDFLAGS="$(TARGET_LDFLAGS) -L$(STAGING_DIR)/opt/lib"
+          endef
+
+          define Package/keensteer/install
+          	$(INSTALL_DIR) $(1)/opt/sbin
+          	$(INSTALL_BIN) $(PKG_BUILD_DIR)/keensteerd $(1)/opt/sbin/keensteerd
+          endef
+
+          $(eval $(call BuildPackage,keensteer))
+          MAKEFILE
+
+          printf '\nCONFIG_PACKAGE_keensteer=m\n' >> .config
+          make defconfig KEENSTEER_VERSION="$version" KEENSTEER_SRC="$src"
+          make -j"$(nproc)" package/keensteer/compile V=s \
+            KEENSTEER_VERSION="$version" KEENSTEER_SRC="$src"
+
+          binary=$(find build_dir -type f \
+            -path '*/ipkg-*/keensteer/opt/sbin/keensteerd' -print -quit)
+          test -n "$binary"
+
+          readelf -h "$binary" | grep -qi 'MIPS'
+          readelf -h "$binary" | grep -qi 'big endian'
+          readelf -l "$binary" | grep -q '/opt/lib/ld.so.1'
+          readelf -d "$binary" | grep -q 'libcrypto.so.3'
+
+          out="$src/dist/keensteer-$version"
+          mkdir -p "$out"
+          cp "$binary" "$out/keensteerd"
+          cp "$src/install.sh" "$src/uninstall.sh" "$out/"
+          cp -a "$src/files" "$out/"
+          cp "$src/README.md" "$src/SETUP.md" "$src/PROTOCOL.md" "$src/LICENSE" "$out/"
+          chmod 0755 "$out/keensteerd" "$out/install.sh" "$out/uninstall.sh" \
+            "$out/files/S99keensteer" "$out/files/keensteer-setup"
+
+          tar -C "$src/dist" -czf "$src/dist/keensteer-$version-mips-3.4.tar.gz" \
+            "keensteer-$version"
+          rm -rf "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keensteer-${{ github.ref_name }}-mips-3.4
+          path: dist/keensteer-*-mips-3.4.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [check, mips]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

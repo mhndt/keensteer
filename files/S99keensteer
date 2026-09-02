@@ -1,0 +1,10 @@
+#!/bin/sh
+
+ENABLED=yes
+PROCS=keensteerd
+ARGS="-c /opt/etc/keensteer.conf"
+PREARGS=""
+DESC="keensteer"
+PATH=/opt/sbin:/opt/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+. /opt/etc/init.d/rc.func

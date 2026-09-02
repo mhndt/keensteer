@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - run: make CC=${{ matrix.cc }}
+      - run: make CC=${{ matrix.cc }} test
+      - run: make clean
+  sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - run: make sanitize
+      - name: Check shell scripts
+        run: |
+          for script in install.sh uninstall.sh files/S99keensteer files/keensteer-setup tests/test-setup.sh; do
+            dash -n "$script"
+          done
