@@ -22,8 +22,12 @@ if [ ! -d "$root/etc/init.d" ]; then
 fi
 
 had_config=0
+was_running=0
 if [ -e "$root/etc/keensteer.conf" ]; then
 	had_config=1
+fi
+if [ -z "$destdir" ] && pidof keensteerd >/dev/null 2>&1; then
+	was_running=1
 fi
 
 if [ ! -x keensteerd ]; then
@@ -68,8 +72,10 @@ trap - EXIT
 echo "Installed $root/sbin/keensteerd"
 if [ "$had_config" -eq 1 ]; then
 	echo "Existing configuration and keys were preserved."
-	if [ -z "$destdir" ]; then
-		echo "Restart with: $root/etc/init.d/S99keensteer restart"
+	if [ -z "$destdir" ] && [ "$was_running" -eq 1 ]; then
+		"$root/etc/init.d/S99keensteer" restart
+	elif [ -z "$destdir" ]; then
+		echo "Start with: $root/etc/init.d/S99keensteer start"
 	fi
 else
 	echo "Created $root/etc/keensteer.conf"

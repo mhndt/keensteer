@@ -350,6 +350,17 @@ static int test_usteer(void)
 		ks_mtk_test_counts(NULL, &n_ioctl); CHECK(n_ioctl == 3);
 		CHECK(!ks_mtk_test_last_ioctl(&oid, &bss, rec, sizeof(rec), &rlen) && rlen == 29 &&
 		      !rec[0x13] && rec[0x0f] == 6 && rec[0x0e] == 81);
+		/* an unsupported OID disables neighbor reports only */
+		tx.cfg.bss[0].channel = 11;
+		CHECK(!ks_usteer_encode(&tx, copy, sizeof(copy), &rlen));
+		rx.ioctl_fd = 1; mock_wext = true;
+		CHECK(ks_usteer_parse(&rx, copy, rlen, &src, now) == 2);
+		mock_wext = false;
+		CHECK(rx.neighbor_off && p->learned && !p->neighbor_channel && rx.cfg.usteer_enabled);
+		rx.ioctl_fd = -2;
+		CHECK(ks_usteer_parse(&rx, copy, rlen, &src, now) == 2 && !p->neighbor_channel);
+		ks_mtk_test_counts(NULL, &n_ioctl); CHECK(n_ioctl == 3);
+		rx.neighbor_off = false; tx.cfg.bss[0].channel = 1;
 	}
 
 	off = 0;

@@ -31,7 +31,7 @@
 #define KS_MTK_MAC_TABLE_IOCTL 0x8bef
 #define KS_OID_FT_QUERY   0x8409
 #define KS_OID_FT_INSERT  0x840a
-#define KS_OID_FT_NEIGHBOR 0x040e
+#define KS_OID_FT_NEIGHBOR 0x840e
 
 #define KS_KDP_ELEMENT_LEN 167
 #define KS_KDP_WRAPPER_LEN 179
@@ -192,6 +192,7 @@ struct ks_state {
 	uint64_t next_reconcile_ms;
 	unsigned int sink_probe_cursor;
 	bool reconcile_off;
+	bool neighbor_off;
 	bool stop;
 };
 

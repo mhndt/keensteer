@@ -466,7 +466,7 @@ int ks_backend_neighbor(struct ks_state *s, int peer_index, int channel, int op_
 	size_t i;
 	char mac[18];
 
-	if (peer_index < 0 || (size_t) peer_index >= s->cfg.n_ft_peers) return -1;
+	if (s->neighbor_off || peer_index < 0 || (size_t) peer_index >= s->cfg.n_ft_peers) return -1;
 	peer = &s->cfg.ft_peers[peer_index];
 	if (!peer->used || channel < 1 || channel > 177 || op_class < 1 || op_class > 255 ||
 	    !ks_mac_unicast(peer->bssid)) return -1;
@@ -481,8 +481,14 @@ int ks_backend_neighbor(struct ks_state *s, int peer_index, int channel, int op_
 	rec[0x13] = present;
 	rec[0x14] = 2;
 	rec[0x15] = 1;
+	errno = 0;
 	if (priv_ioctl(s, (int) i, KS_OID_FT_NEIGHBOR, rec, sizeof(rec))) {
-		ks_log(KS_LOG_DEBUG, "neighbor ioctl failed on %s", s->cfg.bss[i].ifname);
+		if (errno == EOPNOTSUPP) {
+			s->neighbor_off = true;
+			ks_log(KS_LOG_WARN, "FT neighbor reports disabled: not supported on %s",
+			       s->cfg.bss[i].ifname);
+		} else
+			ks_log(KS_LOG_DEBUG, "neighbor ioctl failed on %s", s->cfg.bss[i].ifname);
 		return -1;
 	}
 	ks_mac_format(peer->bssid, mac);
