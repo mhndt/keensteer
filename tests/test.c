@@ -30,6 +30,10 @@ static bool mock_load_error;
 static uint8_t mock_load[8];
 static uint16_t mock_load_len;
 static unsigned int mock_load_calls;
+static bool mock_priv_error, mock_priv_missing;
+static struct { char ifname[IFNAMSIZ]; const char *text; bool error; } mock_table[2];
+static uint16_t mock_table_len;
+static unsigned int mock_table_calls;
 
 int __real_ioctl(int fd, unsigned long request, ...);
 int __wrap_ioctl(int fd, unsigned long request, ...);
@@ -61,10 +65,29 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
 		wrq->u.freq.m = 44;
 		wrq->u.freq.e = 0;
 		return 0;
-	case SIOCGIWPRIV:
-		((struct iw_priv_args *) wrq->u.data.pointer)[0].cmd = SIOCIWFIRSTPRIV + 2;
-		wrq->u.data.length = 1;
+	case SIOCGIWPRIV: {
+		struct iw_priv_args *a = wrq->u.data.pointer;
+
+		if (mock_priv_error) { errno = ENODEV; return -1; }
+		a[0].cmd = SIOCIWFIRSTPRIV + 2; strcpy(a[0].name, "set");
+		a[1].cmd = KS_MTK_MAC_TABLE_IOCTL; strcpy(a[1].name, "get_mac_table");
+		wrq->u.data.length = mock_priv_missing ? 1 : 2;
 		return 0;
+	}
+	case KS_MTK_MAC_TABLE_IOCTL: {
+		size_t i, n;
+
+		mock_table_calls++;
+		for (i = 0; i < 2; i++)
+			if (mock_table[i].text && !strcmp(mock_table[i].ifname, wrq->ifr_name)) break;
+		if (i == 2 || mock_table[i].error) { errno = EOPNOTSUPP; return -1; }
+		n = strlen(mock_table[i].text);
+		if (n > wrq->u.data.length) n = wrq->u.data.length;
+		memcpy(wrq->u.data.pointer, mock_table[i].text, n);
+		if (n) ((uint8_t *) wrq->u.data.pointer)[n - 1] = 0;
+		wrq->u.data.length = mock_table_len ? mock_table_len : (uint16_t) n;
+		return 0;
+	}
 	case KS_MTK_LOAD_IOCTL:
 		mock_load_calls++;
 		if (mock_load_error) { errno = EOPNOTSUPP; return -1; }
@@ -282,11 +305,52 @@ static int test_usteer(void)
 	memcpy(rx.cfg.ft_peers[0].bssid, tx.cfg.bss[0].bssid, 6);
 	CHECK(inet_pton(AF_INET, "192.0.2.22", &src.sin_addr) == 1);
 	rx.cfg.ft_peers[0].peer_ip = src.sin_addr;
+	rx.cfg.n_bss = 1; rx.cfg.bss[0].active = rx.cfg.bss[0].mtk_kdp = true;
+	strcpy(rx.cfg.bss[0].ifname, "ra0"); rx.ioctl_fd = -2; ks_mtk_test_reset();
 	CHECK(ks_usteer_parse(&rx, buf, len, &src, now) == 2);
 	CHECK(rx.cfg.ft_peers[0].learned && !strcmp(rx.cfg.ft_peers[0].ssid, "test-ess"));
-	rx.cfg.ft_peers[0].last_seen_ms = now - rx.cfg.peer_ttl_ms;
-	ks_usteer_expire(&rx, now);
-	CHECK(!rx.cfg.ft_peers[0].learned);
+	{
+		uint8_t rec[64]; size_t rlen; uint16_t oid; int bss; unsigned int n_ioctl;
+		struct ks_ft_peer *p = &rx.cfg.ft_peers[0];
+
+		ks_mtk_test_counts(NULL, &n_ioctl); CHECK(n_ioctl == 1);
+		CHECK(!ks_mtk_test_last_ioctl(&oid, &bss, rec, sizeof(rec), &rlen));
+		CHECK(oid == KS_OID_FT_NEIGHBOR && bss == 0 && rlen == 29);
+		CHECK(!memcmp(rec, &src.sin_addr.s_addr, 4) && !memcmp(rec + 4, tx.cfg.bss[0].bssid, 6));
+		CHECK(rec[0x0e] == 81 && rec[0x0f] == 1 && rec[0x10] == 7 && rec[0x13] == 1 &&
+		      rec[0x14] == 2 && rec[0x15] == 1 && !rec[0x1b] && !rec[0x1c]);
+		CHECK(p->neighbor_channel == 1 && p->neighbor_op_class == 81);
+		CHECK(ks_usteer_parse(&rx, buf, len, &src, now) == 2);
+		ks_mtk_test_counts(NULL, &n_ioctl); CHECK(n_ioctl == 1);
+		/* a failed update keeps the installed record known */
+		tx.cfg.bss[0].channel = 6; rx.ioctl_fd = -1;
+		CHECK(!ks_usteer_encode(&tx, copy, sizeof(copy), &rlen));
+		CHECK(ks_usteer_parse(&rx, copy, rlen, &src, now) == 2);
+		CHECK(p->channel == 6 && p->neighbor_channel == 1);
+		rx.ioctl_fd = -2;
+		CHECK(ks_usteer_parse(&rx, copy, rlen, &src, now) == 2 && p->neighbor_channel == 6);
+		ks_mtk_test_counts(NULL, &n_ioctl); CHECK(n_ioctl == 2);
+		CHECK(!ks_mtk_test_last_ioctl(&oid, &bss, rec, sizeof(rec), &rlen) && rec[0x0f] == 6);
+		/* an invalid operating class is not sent and does not disturb the installed record */
+		tx.cfg.bss[0].op_class = 300;
+		CHECK(!ks_usteer_encode(&tx, copy, sizeof(copy), &rlen));
+		CHECK(ks_usteer_parse(&rx, copy, rlen, &src, now) == 2);
+		CHECK(p->op_class == 300 && p->neighbor_channel == 6 && p->neighbor_op_class == 81);
+		ks_mtk_test_counts(NULL, &n_ioctl); CHECK(n_ioctl == 2);
+		tx.cfg.bss[0].op_class = 81; tx.cfg.bss[0].channel = 1;
+		/* a failed withdrawal is retried until it succeeds */
+		p->last_seen_ms = now - rx.cfg.peer_ttl_ms; rx.ioctl_fd = -1;
+		ks_usteer_expire(&rx, now);
+		CHECK(!p->learned && !p->channel && p->neighbor_channel == 6);
+		ks_usteer_expire(&rx, now);
+		CHECK(p->neighbor_channel == 6);
+		rx.ioctl_fd = -2;
+		ks_usteer_expire(&rx, now);
+		CHECK(!p->neighbor_channel && !p->neighbor_op_class);
+		ks_mtk_test_counts(NULL, &n_ioctl); CHECK(n_ioctl == 3);
+		CHECK(!ks_mtk_test_last_ioctl(&oid, &bss, rec, sizeof(rec), &rlen) && rlen == 29 &&
+		      !rec[0x13] && rec[0x0f] == 6 && rec[0x0e] == 81);
+	}
 
 	off = 0;
 	CHECK(!next_attr(buf, len, &off, &a));
@@ -1179,6 +1243,229 @@ static int test_rrb_dedupe(void)
 	return 0;
 }
 
+static const char table_header_fmt[] =
+	"\n%-13s%-3s%-4s%-3s%-2s%-5s%-5s%-11s%-21s%-21s%-6s%-5s%-5s%-5s%-4s"
+	"%-3s%-3s%-3s%-2s%-2s%-2s%-3s%-3s%-2s%-3s\n";
+
+static size_t table_header(char *out, size_t cap)
+{
+	int n = snprintf(out, cap, table_header_fmt, "MAC", "AP", "AID", "PS", "A", "CTxR",
+			 "LRxR", "LDT", "RxB", "TxB", "HT", "Mode", "ShGI", "RSSI", "MCS", "SS",
+			 "BF", "MU", "K", "R", "V", "RP", "RM", "W", "AU");
+	return n < 0 ? 0 : (size_t) n;
+}
+
+static size_t table_row(char *out, size_t cap, const uint8_t mac[6], int ap, int rssi)
+{
+	int n = snprintf(out, cap, "%02x%02x%02x%02x%02x%02x %-3d%-4d%-3d%-2d%-5d%-5d%-11u"
+			 "%-21llu%-21llu%-6s%-5s%-5d%-5d%-4d%-3d%-3d%-3d%-2d%-2d%-2d%-3d%-3d%-2d%-3d\n",
+			 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], ap, 1, 0, 1, 3, 4, 0u,
+			 1234567890ull, 9876543210ull, "HT", "11n", 1, rssi, 7, 2, 0, 0, 1, 0, 1, 0,
+			 0, 1, 0);
+	return n < 0 ? 0 : (size_t) n;
+}
+
+static int test_reconcile(void)
+{
+	struct ks_state s;
+	struct ks_station *st;
+	static char t0[40000], t1[4096];
+	uint8_t a[6] = { 0x02, 1, 2, 3, 4, 5 }, b[6] = { 0x02, 6, 7, 8, 9, 10 };
+	uint8_t c[6] = { 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, x[6] = { 0x02, 0, 0, 0, 0, 1 };
+	uint8_t y[6] = { 0x02, 0, 0, 0, 0, 2 };
+	uint64_t now = 5000000;
+	size_t n, i;
+
+	sample_state(&s, 2); s.stations[0].connected_ms = now - 100;
+	strcpy(s.cfg.bss[0].ifname, "ra0"); strcpy(s.cfg.bss[1].ifname, "ra8");
+	s.ioctl_fd = 1; mock_wext = true;
+	strcpy(mock_table[0].ifname, "ra0"); strcpy(mock_table[1].ifname, "ra8");
+	mock_table[0].text = t0; mock_table[1].text = t1;
+	mock_table[0].error = mock_table[1].error = false; mock_table_len = 0;
+	CHECK(table_header(t1, sizeof(t1)) == 141 && table_row(t0, sizeof(t0), a, 0, -45) == 140);
+
+	/* single BSS with a missed association, empty second BSS */
+	n = table_header(t0, sizeof(t0));
+	n += table_row(t0 + n, sizeof(t0) - n, c, 0, -45);
+	table_row(t0 + n, sizeof(t0) - n, a, 0, -45);
+	table_header(t1, sizeof(t1));
+	mock_table_calls = 0;
+	CHECK(!ks_backend_reconcile(&s, now) && mock_table_calls == 2 && !s.reconcile_off);
+	CHECK(s.next_reconcile_ms == now + 60000);
+	st = ks_station_get(&s, a, false);
+	CHECK(st && st->connected && st->bss_index == 0 && st->connected_ms == now &&
+	      st->seen_2ghz && !st->seen_5ghz && st->signal[0] == -45 && st->seen_ms[0] == now);
+	CHECK(s.stations[0].connected && s.stations[0].connected_ms == now - 100);
+	CHECK(ks_backend_reconcile(&s, now + 59999) < 0 && mock_table_calls == 2);
+	CHECK(!ks_backend_reconcile(&s, now + 60000) && mock_table_calls == 4);
+	CHECK(st->connected && st->connected_ms == now &&
+	      s.stations[0].connected_ms == now - 100 && s.stations[0].bss_index == 0);
+
+	/* second BSS: c moved to ra8, b missed there, a unchanged */
+	now += 120000;
+	n = table_header(t0, sizeof(t0));
+	table_row(t0 + n, sizeof(t0) - n, a, 0, -45);
+	n = table_header(t1, sizeof(t1));
+	n += table_row(t1 + n, sizeof(t1) - n, c, 8, -45);
+	table_row(t1 + n, sizeof(t1) - n, b, 8, -45);
+	CHECK(!ks_backend_reconcile(&s, now));
+	CHECK(s.stations[0].connected && s.stations[0].bss_index == 1 &&
+	      s.stations[0].connected_ms == now && s.stations[0].seen_2ghz &&
+	      s.stations[0].seen_5ghz && s.stations[0].seen_ms[0] &&
+	      s.stations[0].signal[1] == -45 && s.stations[0].seen_ms[1] == now);
+	st = ks_station_get(&s, b, false);
+	CHECK(st && st->connected && st->bss_index == 1 && st->seen_5ghz);
+	st = ks_station_get(&s, a, false);
+	CHECK(st && st->connected && st->bss_index == 0 && st->connected_ms == now - 120000);
+
+	/* missed disconnect */
+	now += 60000;
+	table_header(t0, sizeof(t0));
+	CHECK(!ks_backend_reconcile(&s, now));
+	CHECK(st->used && !st->connected && st->connected_ms == now && st->bss_index == 0);
+	CHECK(s.stations[0].connected && ks_station_get(&s, b, false)->connected);
+
+	/* one failed query leaves everything untouched */
+	now += 60000;
+	n = table_header(t0, sizeof(t0));
+	table_row(t0 + n, sizeof(t0) - n, x, 0, -45);
+	table_header(t1, sizeof(t1));
+	mock_table[1].error = true; mock_table_calls = 0;
+	CHECK(ks_backend_reconcile(&s, now) < 0 && mock_table_calls == 2 && !s.reconcile_off);
+	CHECK(!ks_station_get(&s, x, false) && s.stations[0].connected &&
+	      ks_station_get(&s, b, false)->connected && !st->connected);
+	mock_table[1].error = false;
+
+	/* malformed rows, inconsistent indices and truncation are rejected */
+	now += 60000;
+	n = table_header(t1, sizeof(t1)); table_row(t1 + n, sizeof(t1) - n, c, 8, -45);
+	n = table_header(t0, sizeof(t0));
+	n += table_row(t0 + n, sizeof(t0) - n, x, 0, -45);
+	table_row(t0 + n, sizeof(t0) - n, a, 1, -45);
+	CHECK(ks_backend_reconcile(&s, now) < 0 && !ks_station_get(&s, x, false));
+	s.next_reconcile_ms = 0;
+	n = table_header(t0, sizeof(t0));
+	table_row(t0 + n, sizeof(t0) - n, x, 8, -45);
+	CHECK(ks_backend_reconcile(&s, now) < 0 && !ks_station_get(&s, x, false));
+	s.next_reconcile_ms = 0;
+	n = table_header(t0, sizeof(t0));
+	table_row(t0 + n, sizeof(t0) - n, c, 0, -45);
+	CHECK(ks_backend_reconcile(&s, now) < 0 && s.stations[0].bss_index == 1);
+	s.next_reconcile_ms = 0;
+	n = table_header(t0, sizeof(t0));
+	n += table_row(t0 + n, sizeof(t0) - n, x, 0, -45);
+	table_row(t0 + n, sizeof(t0) - n, x, 0, -45);
+	CHECK(ks_backend_reconcile(&s, now) < 0 && !ks_station_get(&s, x, false));
+	s.next_reconcile_ms = 0;
+	n = table_header(t0, sizeof(t0));
+	snprintf(t0 + n, sizeof(t0) - n, "0200000000zz 0  1\n");
+	CHECK(ks_backend_reconcile(&s, now) < 0 && !ks_station_get(&s, x, false));
+	s.next_reconcile_ms = 0;
+	snprintf(t0 + n, sizeof(t0) - n, "010000000001 0  1\n");
+	CHECK(ks_backend_reconcile(&s, now) < 0);
+	s.next_reconcile_ms = 0;
+	snprintf(t0 + n, sizeof(t0) - n, "02000000001 0  1\n");
+	CHECK(ks_backend_reconcile(&s, now) < 0);
+	s.next_reconcile_ms = 0;
+	snprintf(t0 + n, sizeof(t0) - n, "020000000001\n");
+	CHECK(ks_backend_reconcile(&s, now) < 0);
+	s.next_reconcile_ms = 0;
+	snprintf(t0 + n, sizeof(t0) - n, "020000000001 x  1\n");
+	CHECK(ks_backend_reconcile(&s, now) < 0);
+	s.next_reconcile_ms = 0;
+	table_row(t0 + n, sizeof(t0) - n, x, 0, -45);
+	mock_table_len = UINT16_MAX - 139;
+	CHECK(ks_backend_reconcile(&s, now) < 0 && !ks_station_get(&s, x, false) &&
+	      !s.reconcile_off);
+	mock_table_len = 0; s.next_reconcile_ms = 0;
+	CHECK(!ks_backend_reconcile(&s, now) && ks_station_get(&s, x, false)->connected);
+
+	/* RSSI column is optional and only plausible values are used */
+	s.next_reconcile_ms = 0;
+	n = table_header(t0, sizeof(t0)); memcpy(strstr(t0, "RSSI"), "RSS ", 4);
+	n += table_row(t0 + n, sizeof(t0) - n, x, 0, -45);
+	table_row(t0 + n, sizeof(t0) - n, y, 0, -50);
+	CHECK(!ks_backend_reconcile(&s, now));
+	st = ks_station_get(&s, y, false);
+	CHECK(st && st->connected && !st->signal[0] && !st->seen_ms[0]);
+	s.next_reconcile_ms = 0;
+	n = table_header(t0, sizeof(t0));
+	n += table_row(t0 + n, sizeof(t0) - n, x, 0, -45);
+	table_row(t0 + n, sizeof(t0) - n, y, 0, 5);
+	CHECK(!ks_backend_reconcile(&s, now) && st->connected && !st->seen_ms[0]);
+	s.next_reconcile_ms = 0;
+	table_row(t0 + n, sizeof(t0) - n, y, 0, -71);
+	CHECK(!ks_backend_reconcile(&s, now) && st->signal[0] == -71 && st->seen_ms[0] == now);
+
+
+	/* station table bounds */
+	n = table_header(t0, sizeof(t0));
+	for (i = 0; i <= KS_MAX_STA; i++) {
+		uint8_t m[6] = { 0x02, 0x33, 0, 0, (uint8_t) (i >> 8), (uint8_t) i };
+		n += table_row(t0 + n, sizeof(t0) - n, m, 0, -45);
+	}
+	CHECK(n < sizeof(t0)); s.next_reconcile_ms = 0;
+	CHECK(ks_backend_reconcile(&s, now) < 0 && ks_station_get(&s, x, false)->connected);
+	for (i = 0; i < KS_MAX_STA; i++) {
+		s.stations[i].used = true;
+		memcpy(s.stations[i].addr, (uint8_t[]) { 0x02, 0x44, 0, 0, (uint8_t) (i >> 8), (uint8_t) i }, 6);
+		s.stations[i].connected = false;
+	}
+	n = table_header(t0, sizeof(t0));
+	table_row(t0 + n, sizeof(t0) - n, a, 0, -45);
+	table_header(t1, sizeof(t1));
+	s.next_reconcile_ms = 0;
+	CHECK(!ks_backend_reconcile(&s, now) && !ks_station_get(&s, a, false));
+	for (i = 0; i < KS_MAX_STA; i++) CHECK(!s.stations[i].connected);
+
+	/* unsupported or unknown format disables reconciliation only */
+	sample_state(&s, 2); s.cfg.ft_enabled = true; s.cfg.bss[0].mtk_kdp = true;
+	strcpy(s.cfg.bss[0].ifname, "ra0"); strcpy(s.cfg.bss[1].ifname, "ra8"); s.ioctl_fd = 1;
+	n = table_header(t0, sizeof(t0));
+	table_row(t0 + n, sizeof(t0) - n, a, 0, -45);
+	mock_priv_missing = true; mock_table_calls = 0;
+	CHECK(ks_backend_reconcile(&s, now) < 0 && s.reconcile_off && !mock_table_calls);
+	CHECK(s.cfg.usteer_enabled && s.cfg.ft_enabled && s.cfg.bss[0].mtk_kdp &&
+	      s.stations[0].connected && !ks_station_get(&s, a, false));
+	s.next_reconcile_ms = 0;
+	CHECK(ks_backend_reconcile(&s, now) < 0 && !mock_table_calls);
+	memcpy(mock_load, (uint8_t[]) { 0, 1, 1, 5, 0, 1, 23, 0 }, 8);
+	mock_load_len = 8; mock_load_error = false; s.next_load_ms = 0;
+	ks_backend_update_load(&s); CHECK(s.cfg.bss[0].load == 23);
+	mock_priv_missing = false; s.reconcile_off = false; s.next_reconcile_ms = 0;
+	mock_priv_error = true;
+	CHECK(ks_backend_reconcile(&s, now) < 0 && !s.reconcile_off && !mock_table_calls);
+	mock_priv_error = false; s.next_reconcile_ms = 0;
+	snprintf(t0, sizeof(t0), "\nAddr AID\n020102030405 0 1\n");
+	CHECK(ks_backend_reconcile(&s, now) < 0 && s.reconcile_off && mock_table_calls == 1);
+	CHECK(!ks_station_get(&s, a, false) && s.stations[0].connected);
+	s.reconcile_off = false; s.next_reconcile_ms = 0; mock_table_calls = 0;
+	s.cfg.usteer_enabled = false;
+	CHECK(ks_backend_reconcile(&s, now) < 0 && !mock_table_calls);
+	mock_wext = false;
+	return 0;
+}
+
+static int test_backend(void)
+{
+	struct ks_state s;
+
+	memset(&s, 0, sizeof(s)); ks_config_defaults(&s.cfg);
+	strcpy(s.cfg.transport_if, "lo"); s.cfg.ft_enabled = s.rrb_key_loaded = true;
+	memset(s.rrb_key, 1, sizeof(s.rrb_key));
+	if (ks_backend_open(&s)) {
+		CHECK(!s.cfg.ft_enabled && !s.cfg.usteer_enabled);
+	} else {
+		CHECK(s.cfg.ft_enabled || s.cfg.usteer_enabled);
+		CHECK(s.cfg.ft_enabled == (s.packet_fd >= 0));
+		CHECK(s.cfg.usteer_enabled == (s.udp_fd >= 0 && s.netlink_fd >= 0));
+	}
+	CHECK(s.cfg.ft_enabled || (!s.rrb_key_loaded && !s.rrb_key[0]));
+	ks_backend_close(&s);
+	CHECK(s.packet_fd < 0 && s.udp_fd < 0 && s.netlink_fd < 0 && s.ioctl_fd < 0);
+	return 0;
+}
+
 int main(void)
 {
 	int n = 0;
@@ -1202,6 +1489,10 @@ int main(void)
 	if (test_rrb_incoming_pull()) return 1;
 	n++;
 	if (test_rrb_dedupe()) return 1;
+	n++;
+	if (test_reconcile()) return 1;
+	n++;
+	if (test_backend()) return 1;
 	n++;
 	printf("ok %d groups\n", n);
 	return 0;

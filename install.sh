@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 
+PATH=/opt/sbin:/opt/bin:/sbin:/bin:/usr/sbin:/usr/bin
 destdir=${DESTDIR:-}
 root=${destdir}/opt
 tmp_binary=$root/sbin/.keensteerd.$$
@@ -29,12 +30,24 @@ if [ ! -x keensteerd ]; then
 	echo "Prebuilt target binary not found: ./keensteerd" >&2
 	exit 1
 fi
+if [ -z "$destdir" ] && [ ! -e "$root/lib/libcrypto.so.3" ]; then
+	echo "Installing libopenssl..."
+	opkg update >/dev/null 2>&1 || true
+	if ! opkg install libopenssl; then
+		echo "Cannot install libopenssl; run: opkg install libopenssl" >&2
+		exit 1
+	fi
+fi
+
 if ! ./keensteerd -V >/dev/null 2>&1; then
-	echo "./keensteerd is not runnable on this target" >&2
+	echo "./keensteerd is not runnable on this target; is libopenssl installed?" >&2
 	exit 1
 fi
 
-trap 'rm -f "$tmp_binary" "$tmp_init" "$tmp_setup"' EXIT HUP INT TERM
+trap 'rm -f "$tmp_binary" "$tmp_init" "$tmp_setup"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 umask 077
 mkdir -p "$root/sbin" "$root/etc"
 cp keensteerd "$tmp_binary"
@@ -50,7 +63,7 @@ if [ ! -e "$root/etc/keensteer.conf" ]; then
 	cp files/keensteer.conf "$root/etc/keensteer.conf"
 	chmod 0600 "$root/etc/keensteer.conf"
 fi
-trap - EXIT HUP INT TERM
+trap - EXIT
 
 echo "Installed $root/sbin/keensteerd"
 if [ "$had_config" -eq 1 ]; then

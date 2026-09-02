@@ -9,7 +9,7 @@
 #include <linux/if.h>
 #include <netinet/in.h>
 
-#define KS_VERSION "1.0.1"
+#define KS_VERSION "1.0.2"
 
 #define KS_MAX_BSS             8
 #define KS_MAX_STA           256
@@ -28,8 +28,10 @@
 #define KS_ETH_P_MTK_KDP  0xeeee
 #define KS_MTK_PRIV_IOCTL 0x8be1
 #define KS_MTK_LOAD_IOCTL 0x8bea
+#define KS_MTK_MAC_TABLE_IOCTL 0x8bef
 #define KS_OID_FT_QUERY   0x8409
 #define KS_OID_FT_INSERT  0x840a
+#define KS_OID_FT_NEIGHBOR 0x040e
 
 #define KS_KDP_ELEMENT_LEN 167
 #define KS_KDP_WRAPPER_LEN 179
@@ -89,6 +91,8 @@ struct ks_ft_peer {
 	bool learned;
 	bool static_config;
 	bool sink_ready;
+	int neighbor_channel;
+	int neighbor_op_class;
 	struct in_addr peer_ip;
 	uint8_t transport[6];
 	uint8_t r1kh_id[6];
@@ -185,7 +189,9 @@ struct ks_state {
 	uint64_t next_usteer_ms;
 	uint64_t next_load_ms;
 	uint64_t next_sink_probe_ms;
+	uint64_t next_reconcile_ms;
 	unsigned int sink_probe_cursor;
+	bool reconcile_off;
 	bool stop;
 };
 
@@ -247,6 +253,7 @@ void ks_usteer_expire(struct ks_state *s, uint64_t now);
 int ks_backend_open(struct ks_state *s);
 void ks_backend_close(struct ks_state *s);
 void ks_backend_reprobe(struct ks_state *s, uint64_t now);
+int ks_backend_reconcile(struct ks_state *s, uint64_t now);
 void ks_backend_update_load(struct ks_state *s);
 int ks_backend_handle_packet(struct ks_state *s);
 int ks_backend_handle_netlink(struct ks_state *s);
@@ -256,6 +263,8 @@ int ks_backend_ft_query(struct ks_state *s, int bss_index,
 int ks_backend_ft_insert(struct ks_state *s, int bss_index,
 			 struct in_addr source,
 			 const struct ks_kdp_element *element);
+int ks_backend_neighbor(struct ks_state *s, int peer_index, int channel, int op_class,
+			bool present);
 int ks_backend_send_rrb(struct ks_state *s, const uint8_t dst[6],
 			const uint8_t *frame, size_t len);
 #ifdef KS_TEST

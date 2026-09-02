@@ -312,6 +312,11 @@ int ks_usteer_parse(struct ks_state *s, const uint8_t *buf, size_t len,
 		strcpy(p->ssid, update[i].ssid);
 		p->channel = update[i].channel;
 		p->op_class = update[i].op_class;
+		if ((p->neighbor_channel != p->channel || p->neighbor_op_class != p->op_class) &&
+		    !ks_backend_neighbor(s, (int) i, p->channel, p->op_class, true)) {
+			p->neighbor_channel = p->channel;
+			p->neighbor_op_class = p->op_class;
+		}
 	}
 	return (int) count;
 }
@@ -321,11 +326,15 @@ void ks_usteer_expire(struct ks_state *s, uint64_t now)
 	size_t i;
 	for (i = 0; i < s->cfg.n_ft_peers; i++) {
 		struct ks_ft_peer *p = &s->cfg.ft_peers[i];
-		if (!p->learned || now - p->last_seen_ms < s->cfg.peer_ttl_ms) continue;
-		p->learned = false;
-		p->last_seen_ms = 0;
-		p->ssid[0] = 0;
-		p->channel = p->op_class = 0;
+		if (p->learned && now - p->last_seen_ms >= s->cfg.peer_ttl_ms) {
+			p->learned = false;
+			p->last_seen_ms = 0;
+			p->ssid[0] = 0;
+			p->channel = p->op_class = 0;
+		}
+		if (!p->learned && p->neighbor_channel &&
+		    !ks_backend_neighbor(s, (int) i, p->neighbor_channel, p->neighbor_op_class, false))
+			p->neighbor_channel = p->neighbor_op_class = 0;
 	}
 }
 

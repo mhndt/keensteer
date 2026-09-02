@@ -17,6 +17,7 @@ On OpenWrt:
 On Keenetic:
 
 - [Entware](https://support.keenetic.com/hero-dsl/kn-2410/en/20980-installing-the-entware-repository-on-a-usb-drive.html)
+- libopenssl from Entware (install.sh installs it when missing)
 
 ## Install
 
@@ -26,7 +27,7 @@ SSH into the Keenetic Entware shell:
 ssh -p 222 root@192.168.1.1
 ```
 
-Use your Keenetic address. Entware normally uses port 222 when Keenetic's SSH server component is installed; otherwise it uses port 22.
+Replace `192.168.1.1` with your Keenetic's address. Entware uses port 222 when KeeneticOS's SSH server component is installed; otherwise Entware uses port 22.
 
 Download and install the release:
 
@@ -42,7 +43,7 @@ cd keensteer-1.0.1
 
 The installer puts keensteer under /opt. Existing configuration and keys are left alone when upgrading.
 
-The setup helper discovers the Keenetic radios, configures every matching OpenWrt access point over SSH and writes the keensteer configuration. See [SETUP.md](SETUP.md) for the guided and manual setup paths.
+The setup helper discovers the Keenetic radios, configures every matching access point on each OpenWrt host over SSH and writes the keensteer configuration. See [SETUP.md](SETUP.md) for the guided and manual setup paths.
 
 # Usage
 
@@ -68,7 +69,7 @@ The config and keys are kept when uninstalling.
 
 # Compatibility
 
-keensteer has been tested on a Keenetic Hero DSL KN-2410 with a TP-Link RE200 running OpenWrt. Other Keenetic models may work but have not been tested yet.
+keensteer has been tested on a Keenetic Hero DSL KN-2410 running KeeneticOS 5.1.3 with a TP-Link RE200 v4 running OpenWrt. Other Keenetic models may work but have not been tested yet.
 
 [PROTOCOL.md](PROTOCOL.md) contains the protocol and reverse-engineering notes.
 

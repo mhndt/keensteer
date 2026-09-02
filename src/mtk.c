@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <linux/if_arp.h>
+#include <linux/filter.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/netlink.h>
@@ -30,6 +31,8 @@
 #define BNDSTRG_BAND_2GHZ 2
 #define LOAD_UPDATE_MS 3000
 #define SINK_REPROBE_MS 30000
+#define RECONCILE_MS 60000
+#define MAC_TABLE_ROW 140
 
 #ifdef KS_TEST
 static uint8_t test_rrb[KS_MAX_PACKET], test_ioctl[KS_KDP_WRAPPER_LEN];
@@ -38,6 +41,8 @@ static unsigned int test_rrb_count, test_ioctl_count;
 static uint16_t test_oid;
 static int test_bss;
 #endif
+
+static uint8_t mac_table[UINT16_MAX];
 
 static int nonblock(int fd)
 {
@@ -81,36 +86,72 @@ static bool local_ipv4(struct in_addr addr)
 	return found;
 }
 
-int ks_backend_open(struct ks_state *s)
+static int open_ft(struct ks_state *s)
+{
+	/* only received KDP and RRB frames reach userspace */
+	struct sock_filter prog[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_PKTTYPE),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, PACKET_OUTGOING, 4, 0),
+		BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 12),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, KS_ETH_P_MTK_KDP, 1, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, KS_ETH_P_RRB, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, 0xffffffff),
+		BPF_STMT(BPF_RET | BPF_K, 0),
+	};
+	struct sock_fprog fp = { sizeof(prog) / sizeof(prog[0]), prog };
+
+	s->packet_fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ALL));
+	if (s->packet_fd < 0 || nonblock(s->packet_fd)) return -1;
+	if (setsockopt(s->packet_fd, SOL_SOCKET, SO_ATTACH_FILTER, &fp, sizeof(fp)))
+		ks_log(KS_LOG_DEBUG, "packet filter unavailable: %s", strerror(errno));
+	return 0;
+}
+
+static int open_usteer(struct ks_state *s)
 {
 	struct sockaddr_nl nl;
 	struct sockaddr_in sin;
 	int one = 1;
 
-	s->udp_fd = s->packet_fd = s->netlink_fd = s->ioctl_fd = -1;
-	if (s->cfg.ft_enabled || s->cfg.usteer_enabled)
-		s->ioctl_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-	if (s->cfg.ft_enabled) {
-		s->packet_fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ALL));
-		if (s->ioctl_fd < 0 || s->packet_fd < 0 || nonblock(s->packet_fd)) goto bad;
+	s->netlink_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	s->udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (s->netlink_fd < 0 || s->udp_fd < 0 || nonblock(s->netlink_fd) ||
+	    nonblock(s->udp_fd)) return -1;
+	memset(&nl, 0, sizeof(nl));
+	nl.nl_family = AF_NETLINK;
+	nl.nl_groups = RTMGRP_LINK;
+	if (bind(s->netlink_fd, (struct sockaddr *) &nl, sizeof(nl))) return -1;
+	setsockopt(s->udp_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	if (setsockopt(s->udp_fd, SOL_SOCKET, SO_BINDTODEVICE,
+		       s->cfg.transport_if, strlen(s->cfg.transport_if) + 1)) return -1;
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons(16720);
+	return bind(s->udp_fd, (struct sockaddr *) &sin, sizeof(sin)) ? -1 : 0;
+}
+
+static void close_fd(int *fd)
+{
+	if (*fd >= 0) { close(*fd); *fd = -1; }
+}
+
+int ks_backend_open(struct ks_state *s)
+{
+	s->udp_fd = s->packet_fd = s->netlink_fd = -1;
+	s->ioctl_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (s->ioctl_fd < 0) return -1;
+	if (s->cfg.ft_enabled && open_ft(s)) {
+		ks_log(KS_LOG_WARN, "FT disabled: %s", strerror(errno));
+		close_fd(&s->packet_fd);
+		s->cfg.ft_enabled = s->rrb_key_loaded = false;
+		ks_secure_clear(s->rrb_key, sizeof(s->rrb_key));
 	}
-	if (s->cfg.usteer_enabled) {
-		s->netlink_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
-		s->udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-		if (s->netlink_fd < 0 || s->udp_fd < 0 || nonblock(s->netlink_fd) ||
-		    nonblock(s->udp_fd)) goto bad;
-		memset(&nl, 0, sizeof(nl));
-		nl.nl_family = AF_NETLINK;
-		nl.nl_groups = RTMGRP_LINK;
-		if (bind(s->netlink_fd, (struct sockaddr *) &nl, sizeof(nl))) goto bad;
-		setsockopt(s->udp_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-		if (setsockopt(s->udp_fd, SOL_SOCKET, SO_BINDTODEVICE,
-			       s->cfg.transport_if, strlen(s->cfg.transport_if) + 1)) goto bad;
-		memset(&sin, 0, sizeof(sin));
-		sin.sin_family = AF_INET;
-		sin.sin_port = htons(16720);
-		if (bind(s->udp_fd, (struct sockaddr *) &sin, sizeof(sin))) goto bad;
+	if (s->cfg.usteer_enabled && open_usteer(s)) {
+		ks_log(KS_LOG_WARN, "usteer disabled: %s", strerror(errno));
+		close_fd(&s->netlink_fd); close_fd(&s->udp_fd);
+		s->cfg.usteer_enabled = false;
 	}
+	if (!s->cfg.ft_enabled && !s->cfg.usteer_enabled) { ks_backend_close(s); return -1; }
 	if (s->cfg.ft_enabled) for (size_t i = 0; i < s->cfg.n_ft_peers; i++) {
 		struct ks_ft_peer *p = &s->cfg.ft_peers[i];
 		char ip[INET_ADDRSTRLEN];
@@ -122,8 +163,6 @@ int ks_backend_open(struct ks_state *s)
 	}
 	s->next_sink_probe_ms = ks_now_ms() + SINK_REPROBE_MS;
 	return 0;
-bad:
-	ks_backend_close(s); return -1;
 }
 
 void ks_backend_update_load(struct ks_state *s)
@@ -176,6 +215,193 @@ void ks_backend_reprobe(struct ks_state *s, uint64_t now)
 	}
 }
 
+static int priv_listed(int fd, const char *ifname, unsigned int cmd, const char *name)
+{
+	struct iw_priv_args args[256];
+	struct iwreq wrq;
+	unsigned int i;
+
+	memset(&wrq, 0, sizeof(wrq));
+	memcpy(wrq.ifr_name, ifname, strlen(ifname) + 1);
+	wrq.u.data.pointer = args; wrq.u.data.length = sizeof(args) / sizeof(args[0]);
+	if (ioctl(fd, SIOCGIWPRIV, &wrq) < 0 ||
+	    wrq.u.data.length > sizeof(args) / sizeof(args[0])) return -1;
+	for (i = 0; i < wrq.u.data.length; i++)
+		if (args[i].cmd == cmd && !strncmp(args[i].name, name, IFNAMSIZ)) return 0;
+	return -2;
+}
+
+static size_t token(const uint8_t *s, size_t len, size_t *pos, const uint8_t **tok)
+{
+	size_t start;
+
+	while (*pos < len && (s[*pos] == ' ' || s[*pos] == '\t' || s[*pos] == '\r')) (*pos)++;
+	start = *pos;
+	while (*pos < len && s[*pos] > ' ') (*pos)++;
+	*tok = s + start;
+	return *pos - start;
+}
+
+static int mac_token(const uint8_t *t, size_t n, uint8_t mac[6])
+{
+	char buf[18];
+	size_t i;
+
+	if (n != 12) return -1;
+	for (i = 0; i < 6; i++) {
+		buf[i * 3] = (char) t[i * 2]; buf[i * 3 + 1] = (char) t[i * 2 + 1];
+		buf[i * 3 + 2] = i < 5 ? ':' : 0;
+	}
+	return ks_mac_parse(buf, mac) ? 0 : -1;
+}
+
+static int number(const uint8_t *t, size_t n, int *v)
+{
+	int neg = n > 1 && *t == '-';
+
+	if (neg) { t++; n--; }
+	if (!n || n > 3) return -1;
+	for (*v = 0; n; n--, t++) {
+		if (*t < '0' || *t > '9') return -1;
+		*v = *v * 10 + (*t - '0');
+	}
+	if (neg) *v = -*v;
+	return 0;
+}
+
+/*
+ * get_mac_table text: a header naming the columns, then one row per
+ * associated station starting with its MAC, the MediaTek BSS index in the
+ * AP column and the averaged RSSI in dBm in the RSSI column. Returns -3
+ * when no header is recognized.
+ */
+static int mac_table_parse(const uint8_t *buf, size_t len, uint8_t (*macs)[6],
+			   int8_t *rssi, size_t cap, size_t *n, int *bss)
+{
+	size_t off = 0, cnt = 0;
+	int col = -1, rcol = -1, idx = -1;
+
+	while (off < len && buf[off]) {
+		const uint8_t *line = buf + off, *t;
+		size_t llen = 0, pos = 0, tlen, k;
+		int ap = -1, r = 0;
+		uint8_t mac[6];
+
+		while (off < len && buf[off] && buf[off] != '\n') { off++; llen++; }
+		if (off < len && buf[off] == '\n') off++;
+		tlen = token(line, llen, &pos, &t);
+		if (!tlen) continue;
+		if (col < 0) {
+			if (tlen != 3 || memcmp(t, "MAC", 3)) return -3;
+			for (k = 1; (tlen = token(line, llen, &pos, &t)) != 0; k++) {
+				if (tlen == 2 && !memcmp(t, "AP", 2)) col = (int) k;
+				if (tlen == 4 && !memcmp(t, "RSSI", 4)) rcol = (int) k;
+			}
+			if (col < 0) return -3;
+			continue;
+		}
+		if (mac_token(t, tlen, mac)) return -1;
+		for (k = 1; (tlen = token(line, llen, &pos, &t)) != 0; k++) {
+			if ((int) k == col && (number(t, tlen, &ap) || ap < 0)) return -1;
+			if ((int) k == rcol && (number(t, tlen, &r) || r < -100 || r > -1)) r = 0;
+		}
+		if (ap < 0) return -1;
+		if (idx < 0) idx = ap; else if (idx != ap) return -1;
+		for (k = 0; k < cnt; k++) if (ks_mac_equal(macs[k], mac)) return -1;
+		if (cnt == cap) return -1;
+		rssi[cnt] = (int8_t) r;
+		memcpy(macs[cnt++], mac, 6);
+	}
+	if (col < 0) return -3;
+	*n = cnt; *bss = idx;
+	return 0;
+}
+
+static int mac_table_query(struct ks_state *s, const struct ks_bss *b, uint8_t (*macs)[6],
+			   int8_t *rssi, size_t cap, size_t *n, int *bss)
+{
+	struct iwreq wrq;
+
+	memset(&wrq, 0, sizeof(wrq));
+	memcpy(wrq.ifr_name, b->ifname, strlen(b->ifname) + 1);
+	wrq.u.data.pointer = mac_table; wrq.u.data.length = sizeof(mac_table);
+	/* the driver stops emitting rows once fewer than MAC_TABLE_ROW bytes remain */
+	if (ioctl(s->ioctl_fd, KS_MTK_MAC_TABLE_IOCTL, &wrq) < 0 || !wrq.u.data.length ||
+	    wrq.u.data.length > sizeof(mac_table) - MAC_TABLE_ROW) return -1;
+	return mac_table_parse(mac_table, wrq.u.data.length, macs, rssi, cap, n, bss);
+}
+
+int ks_backend_reconcile(struct ks_state *s, uint64_t now)
+{
+	uint8_t macs[KS_MAX_STA][6], owner[KS_MAX_STA];
+	int8_t rssi[KS_MAX_STA];
+	int index[KS_MAX_BSS];
+	size_t i, j, n = 0, added = 0, moved = 0, dropped = 0;
+	char mac[18];
+
+	if (!s->cfg.usteer_enabled || s->reconcile_off || s->ioctl_fd < 0 ||
+	    now < s->next_reconcile_ms) return -1;
+	s->next_reconcile_ms = now + RECONCILE_MS;
+	for (i = 0; i < s->cfg.n_bss; i++) {
+		struct ks_bss *b = &s->cfg.bss[i];
+		size_t cnt = 0;
+		int rc;
+
+		index[i] = -1;
+		if (!b->active) continue;
+		rc = priv_listed(s->ioctl_fd, b->ifname, KS_MTK_MAC_TABLE_IOCTL, "get_mac_table");
+		if (!rc) rc = mac_table_query(s, b, macs + n, rssi + n, KS_MAX_STA - n, &cnt, &index[i]);
+		if (rc < -1) {
+			s->reconcile_off = true;
+			ks_log(KS_LOG_WARN, "station reconciliation disabled: %s on %s",
+			       rc == -2 ? "no get_mac_table" : "unknown get_mac_table format", b->ifname);
+			return -1;
+		}
+		if (rc) {
+			ks_log(KS_LOG_DEBUG, "station table query failed on %s", b->ifname);
+			return -1;
+		}
+		for (j = 0; j < i; j++)
+			if (index[j] >= 0 && index[j] == index[i]) return -1;
+		for (j = 0; j < cnt; j++) {
+			size_t k;
+			for (k = 0; k < n; k++) if (ks_mac_equal(macs[k], macs[n + j])) return -1;
+			owner[n + j] = (uint8_t) i;
+		}
+		n += cnt;
+	}
+	for (i = 0; i < KS_MAX_STA; i++) {
+		struct ks_station *st = &s->stations[i];
+
+		if (!st->used || !st->connected) continue;
+		if (st->bss_index >= 0 && (size_t) st->bss_index < s->cfg.n_bss &&
+		    !s->cfg.bss[st->bss_index].active) continue;
+		for (j = 0; j < n && !ks_mac_equal(macs[j], st->addr); j++) ;
+		if (j < n) continue;
+		st->connected = false; st->connected_ms = now; dropped++;
+		ks_mac_format(st->addr, mac);
+		ks_log(KS_LOG_DEBUG, "reconcile: %s disconnected", mac);
+	}
+	for (j = 0; j < n; j++) {
+		struct ks_station *st = ks_station_get(s, macs[j], true);
+		int bss = owner[j];
+
+		if (!st) continue;
+		if (rssi[j]) { st->signal[bss] = rssi[j]; st->seen_ms[bss] = now; }
+		if (st->connected && st->bss_index == bss) continue;
+		if (st->connected) moved++; else added++;
+		st->connected = true; st->bss_index = bss; st->connected_ms = now;
+		st->seen_2ghz |= s->cfg.bss[bss].band == KS_BAND_2GHZ;
+		st->seen_5ghz |= s->cfg.bss[bss].band == KS_BAND_5GHZ;
+		ks_mac_format(st->addr, mac);
+		ks_log(KS_LOG_DEBUG, "reconcile: %s connected on %s", mac, s->cfg.bss[bss].ifname);
+	}
+	if (added || moved || dropped)
+		ks_log(KS_LOG_INFO, "station reconciliation: %zu connected, %zu moved, %zu disconnected",
+		       added, moved, dropped);
+	return 0;
+}
+
 void ks_backend_close(struct ks_state *s)
 {
 	int *fds[] = { &s->udp_fd, &s->packet_fd, &s->netlink_fd, &s->ioctl_fd };
@@ -224,6 +450,45 @@ int ks_backend_ft_insert(struct ks_state *s, int bss_index, struct in_addr sourc
 	rc = priv_ioctl(s, bss_index, KS_OID_FT_INSERT, req, sizeof(req));
 	ks_secure_clear(req, sizeof(req));
 	return rc;
+}
+
+/*
+ * FT neighbor record: correlation IPv4, then the 802.11k neighbor fields
+ * (BSSID, BSSID information, operating class, channel, PHY type), mobility
+ * domain, present flag, state 2, changed flag and empty ACL lists. The
+ * driver scans the channel when the BSS is missing from its scan table.
+ */
+int ks_backend_neighbor(struct ks_state *s, int peer_index, int channel, int op_class,
+			bool present)
+{
+	uint8_t rec[29] = {0};
+	struct ks_ft_peer *peer;
+	size_t i;
+	char mac[18];
+
+	if (peer_index < 0 || (size_t) peer_index >= s->cfg.n_ft_peers) return -1;
+	peer = &s->cfg.ft_peers[peer_index];
+	if (!peer->used || channel < 1 || channel > 177 || op_class < 1 || op_class > 255 ||
+	    !ks_mac_unicast(peer->bssid)) return -1;
+	for (i = 0; i < s->cfg.n_bss; i++)
+		if (s->cfg.bss[i].active && s->cfg.bss[i].mtk_kdp) break;
+	if (i == s->cfg.n_bss) return -1;
+	memcpy(rec, &peer->peer_ip.s_addr, 4);
+	memcpy(rec + 4, peer->bssid, 6);
+	rec[0x0e] = (uint8_t) op_class;
+	rec[0x0f] = (uint8_t) channel;
+	rec[0x10] = channel <= 14 ? 7 : 9;
+	rec[0x13] = present;
+	rec[0x14] = 2;
+	rec[0x15] = 1;
+	if (priv_ioctl(s, (int) i, KS_OID_FT_NEIGHBOR, rec, sizeof(rec))) {
+		ks_log(KS_LOG_DEBUG, "neighbor ioctl failed on %s", s->cfg.bss[i].ifname);
+		return -1;
+	}
+	ks_mac_format(peer->bssid, mac);
+	ks_log(KS_LOG_DEBUG, "neighbor %s %s channel %d on %s", mac,
+	       present ? "added" : "removed", channel, s->cfg.bss[i].ifname);
+	return 0;
 }
 
 int ks_backend_send_rrb(struct ks_state *s, const uint8_t dst[6],
@@ -670,6 +935,7 @@ int ks_kdp_pull_request(struct ks_state *s, int source_bss, int peer_index,
 	p->peer_index = peer_index;
 	p->deadline_ms = ks_now_ms() + s->cfg.kdp_timeout_ms;
 	if (ks_backend_ft_query(s, source_bss, &q, p->correlation)) {
+		ks_log(KS_LOG_WARN, "KDP pull query on %s failed", bss->ifname);
 		ks_secure_clear(p, sizeof(*p)); ks_secure_clear(&q, sizeof(q));
 		return ks_rrb_send_resp(s, peer_index, source_bss, nonce, sta, NULL);
 	}
@@ -753,11 +1019,19 @@ int ks_kdp_handle_response(struct ks_state *s, int ifindex, uint32_t correlation
 		if (p->rrb_pull && memcmp(p->pmkr0name, e + KDP_PMKR0NAME, 16))
 			continue;
 		peer = p->peer_index;
-		if (p->source_bss < 0 || (size_t) p->source_bss >= s->cfg.n_bss ||
-		    e[KDP_R0KH_LEN] != s->cfg.bss[p->source_bss].r0kh_id_len ||
+		if (p->source_bss < 0 || (size_t) p->source_bss >= s->cfg.n_bss)
+			return pending_miss(s, p);
+		if (e[KDP_R0KH_LEN] != s->cfg.bss[p->source_bss].r0kh_id_len ||
 		    memcmp(e + KDP_R0KH_ID, s->cfg.bss[p->source_bss].r0kh_id,
 			   e[KDP_R0KH_LEN]) ||
 		    !ks_mac_equal(e + KDP_R0KH_MAC, s->cfg.bss[p->source_bss].bssid)) {
+			char want[18], got[18];
+
+			ks_mac_format(s->cfg.bss[p->source_bss].bssid, want);
+			ks_mac_format(e + KDP_R0KH_MAC, got);
+			ks_log(KS_LOG_WARN, "KDP %s response on %s selected BSS %s, expected %s",
+			       p->rrb_pull ? "pull" : "prewarm",
+			       s->cfg.bss[p->source_bss].ifname, got, want);
 			return pending_miss(s, p);
 		}
 		if (!memcmp(e + KDP_PMKR0NAME, (uint8_t[16]) {0}, 16) ||

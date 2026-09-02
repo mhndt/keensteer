@@ -13,11 +13,11 @@ Install keensteer on the Keenetic, then run:
 /opt/sbin/keensteer-setup
 ```
 
-The helper discovers the active Keenetic radios and asks for the OpenWrt IPv4 address and Mobility Domain.
+The helper discovers the active Keenetic radios and asks for one or more OpenWrt IPv4 addresses and the Mobility Domain.
 
-It connects to OpenWrt over SSH, finds every enabled access point using the same SSID and configures all matching 2.4 GHz and 5 GHz interfaces for 802.11r. OpenWrt radios using other SSIDs are left alone.
+It connects to each OpenWrt host over SSH, finds every enabled access point using the same SSID and configures all matching 2.4 GHz and 5 GHz interfaces for 802.11r. OpenWrt radios using other SSIDs are left alone. When several OpenWrt hosts are given, each also receives the R0KH and R1KH entries of the others. The usteer node names are derived from the Keenetic hostname.
 
-The helper preserves an existing key or generates a new one, configures the matching R0KH and R1KH entries on OpenWrt, installs the TCP/3517 listener and writes /opt/etc/keensteer.conf.
+The helper preserves an existing key or generates a new one, enables 802.11r with the Mobility Domain and 802.11k/v on the Keenetic access points, configures the matching R0KH, R1KH and 802.11k/v settings on OpenWrt, installs the TCP/3517 listener on every host and writes /opt/etc/keensteer.conf. Running it again rewrites the configuration and keeps the previous one as keensteer.conf.bak, so name every OpenWrt host on each run.
 
 The helper will ask for your OpenWrt root password.
 
@@ -76,17 +76,19 @@ The device FT MAC is the roaming interface MAC incremented by one. The setup hel
 
 ## 2. Enable FT on the Keenetic
 
-Use the same two-character Mobility Domain on each participating Keenetic access point:
+Use the same two-character Mobility Domain on each participating Keenetic access point and enable 802.11k/v, which the web interface shows as Radio Resource & BSS Transition Management:
 
 ```sh
 ndmc -c 'interface WifiMaster0/AccessPoint0 ft enable'
 ndmc -c 'interface WifiMaster0/AccessPoint0 ft mdid KN'
 ndmc -c 'interface WifiMaster1/AccessPoint0 ft enable'
 ndmc -c 'interface WifiMaster1/AccessPoint0 ft mdid KN'
+ndmc -c 'interface WifiMaster0/AccessPoint0 rrm'
+ndmc -c 'interface WifiMaster1/AccessPoint0 rrm'
 ndmc -c 'system configuration save'
 ```
 
-Leave Keenetic's built-in roaming services enabled.
+Leave Keenetic's built-in roaming services enabled. The rrm setting is also what lets keensteer add the OpenWrt access points to the Keenetic's neighbor reports.
 
 ## 3. Find the OpenWrt values
 
@@ -163,6 +165,8 @@ Set:
 | Generate PMK locally | disabled |
 | R1 Key Holder | OpenWrt BSSID without colons |
 | PMK R1 Push | disabled |
+| 802.11k neighbor and beacon reports | enabled |
+| 802.11v BSS Transition Management | enabled |
 
 For an OpenWrt BSSID of 02:00:00:00:00:20, both the NAS ID and R1 Key Holder are 020000000020.
 
@@ -178,9 +182,11 @@ uci set wireless.$WIFI.ft_over_ds='0'
 uci set wireless.$WIFI.ft_psk_generate_local='0'
 uci set wireless.$WIFI.r1_key_holder='020000000020'
 uci set wireless.$WIFI.pmk_r1_push='0'
+uci set wireless.$WIFI.ieee80211k='1'
+uci set wireless.$WIFI.bss_transition='1'
 ```
 
-If the roaming fields are missing in LuCI, install a wpad package with WPA3/SAE and 802.11r support, such as wpad-basic-openssl.
+If the roaming fields are missing in LuCI, install a wpad package with WPA3/SAE and 802.11r support, such as wpad-basic-openssl. usteer uses the 802.11k neighbor reports and 802.11v transition requests to steer clients instead of disconnecting them.
 
 ## 6. Add the OpenWrt R0KH and R1KH entries
 
@@ -321,3 +327,26 @@ ndmc -c 'show log' | grep -i keensteer | tail -n 30
 ```
 
 The daemon should start with FT enabled and without a TCP/3517 warning.
+
+# Multiple access points
+
+keensteer runs on each Keenetic and only talks to OpenWrt. The roaming edges in a mixed network are:
+
+| Roam | Handled by |
+| --- | --- |
+| Keenetic to or from OpenWrt | keensteer on that Keenetic |
+| OpenWrt to OpenWrt | hostapd, through mutual R0KH and R1KH entries |
+| Keenetic to Keenetic | Keenetic itself; only within a Keenetic Wi-Fi System |
+
+Every Keenetic needs one ft_peer line per OpenWrt BSS it should roam with, using the IPv4 address of the host that owns the BSS, and every OpenWrt host needs the R0KH and R1KH entries of every Keenetic BSS. Up to 16 ft_peer lines are supported.
+
+To add another OpenWrt host by hand, repeat steps 3 and 5 to 7 on that host with its own address in the TCP/3517 listener, add its BSSes to keensteer.conf as in step 8, and add the R0KH and R1KH entries of the two OpenWrt hosts to each other so they can roam directly:
+
+```sh
+uci add_list wireless.$WIFI.r0kh="<other BSSID>,<other NAS ID>,$RRB_KEY"
+uci add_list wireless.$WIFI.r1kh="<other BSSID>,<other BSSID>,$RRB_KEY"
+```
+
+With several Keenetics, run the setup helper on each one with the same Mobility Domain and the same OpenWrt hosts. Each Keenetic derives its own R0KH IDs from its roaming interface MAC, and the helper only replaces OpenWrt entries carrying that Keenetic's MAC, so the entries of the other Keenetics stay in place. Give each Keenetic a distinct hostname, because the usteer node names are derived from it.
+
+Clients move from OpenWrt to a Keenetic when usteer steers them or when they decide to roam. Clients move from a Keenetic to OpenWrt only when they decide to roam; Keenetic steers between its own bands and does not issue transition requests towards OpenWrt.

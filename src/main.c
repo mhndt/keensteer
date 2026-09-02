@@ -212,6 +212,7 @@ static int run(struct ks_state *s)
 			ks_kdp_expire(s, now);
 			ks_rrb_expire(s, now);
 			ks_backend_reprobe(s, now);
+			(void) ks_backend_reconcile(s, now);
 			next_expire = now + 1000;
 		}
 		if (s->cfg.usteer_enabled && now >= s->next_usteer_ms) {
