@@ -19,7 +19,7 @@ It connects to OpenWrt over SSH, finds every enabled access point using the same
 
 The helper preserves an existing key or generates a new one, configures the matching R0KH and R1KH entries on OpenWrt, installs the TCP/3517 listener and writes /opt/etc/keensteer.conf.
 
-Root SSH access from the Keenetic to OpenWrt is required for guided setup. Use the manual setup below if SSH is unavailable.
+The helper will ask for your OpenWrt root password.
 
 
 # Manual setup
@@ -34,7 +34,7 @@ The examples use:
 | Keenetic RRB MAC | 02:00:00:00:00:10 |
 | OpenWrt Wi-Fi section | default_radio1 |
 | OpenWrt BSSID | 02:00:00:00:00:20 |
-| OpenWrt IPv4 address | 192.0.2.20 |
+| OpenWrt IPv4 address | 192.168.1.2 |
 | Mobility Domain | KN / 4b4e |
 
 Replace every example value with the value from your network.
@@ -128,8 +128,8 @@ If OpenSSL is unavailable:
 
 ```sh
 umask 077
-od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > /tmp/keensteer.rrb.key
-echo >> /tmp/keensteer.rrb.key
+dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -b |
+awk 'NF > 1 { for (i = 2; i <= NF; i++) { n = substr($i,1,1) * 64 + substr($i,2,1) * 8 + substr($i,3,1); printf "%02x", n } } END { print "" }' > /tmp/keensteer.rrb.key
 ```
 
 Copy the file to the Keenetic as:
@@ -230,23 +230,44 @@ Keenetic's native roaming service opens an extra TCP connection during the key e
 Install socat:
 
 ```sh
-opkg update
-opkg install socat
+if command -v apk >/dev/null 2>&1; then
+	apk update
+	apk add socat
+else
+	opkg update
+	opkg install socat
+fi
 ```
 
-On an apk-based OpenWrt release, use apk update and apk add socat instead.
-
-In LuCI, open **System → Startup → Local Startup** and add this before `exit 0`:
+Create the OpenWrt service:
 
 ```sh
-/usr/bin/socat 'TCP-LISTEN:3517,bind=192.0.2.20,reuseaddr,fork' /dev/null &
+cat > /etc/init.d/keensteer-rrb-sink <<'EOF'
+#!/bin/sh /etc/rc.common
+
+START=90
+USE_PROCD=1
+
+start_service()
+{
+	procd_open_instance
+	procd_set_param command /usr/bin/socat "TCP-LISTEN:3517,bind=192.168.1.2,reuseaddr,fork" /dev/null
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}
+EOF
+
+chmod 0755 /etc/init.d/keensteer-rrb-sink
+/etc/init.d/keensteer-rrb-sink enable
+
+if /etc/init.d/keensteer-rrb-sink status >/dev/null 2>&1; then
+	/etc/init.d/keensteer-rrb-sink restart
+else
+	/etc/init.d/keensteer-rrb-sink start
+fi
 ```
 
-Replace 192.0.2.20 with the OpenWrt address used in the keensteer peer entry, then start it now without rebooting:
-
-```sh
-/usr/bin/socat 'TCP-LISTEN:3517,bind=192.0.2.20,reuseaddr,fork' /dev/null &
-```
+Replace `192.168.1.2` if OpenWrt uses another address.
 
 ## 8. Configure keensteer
 
@@ -264,7 +285,7 @@ rrb_key_file=/opt/etc/keensteer.rrb.key
 bss=ra0,keenetic.2g,example-wifi,02:00:00:00:00:10,6,81,,Keenetic:02:00:00:00:00:11-00
 bss=ra8,keenetic.5g,example-wifi,02:00:00:00:00:21,44,128,,Keenetic:02:00:00:00:00:11-10
 
-ft_peer=02:00:00:00:00:20,02:00:00:00:00:20,192.0.2.20,02:00:00:00:00:20,020000000020
+ft_peer=02:00:00:00:00:20,02:00:00:00:00:20,192.168.1.2,02:00:00:00:00:20,020000000020
 ```
 
 Each bss line contains:

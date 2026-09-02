@@ -50,7 +50,7 @@ esac
 EOF
 chmod 0755 "$root/bin/ssh"
 
-printf '192.0.2.20\nKN\ny\n' | \
+printf '192.168.1.2\nKN\ny\n' | \
 	KEENSTEER_ROOT=$root KEENSTEER_NDMC=$root/bin/ndmc \
 	KEENSTEER_SSH=$root/bin/ssh \
 	./files/keensteer-setup >/dev/null
@@ -61,8 +61,8 @@ key=$root/opt/etc/keensteer.rrb.key
 
 grep -qx 'bss=ra0,keenetic.2g,example-wifi,02:11:22:33:44:50,10,81,,Keenetic:02:11:22:33:44:51-00' "$config"
 grep -qx 'bss=ra8,keenetic.5g,example-wifi,02:11:22:33:45:50,44,128,,Keenetic:02:11:22:33:44:51-10' "$config"
-grep -qx 'ft_peer=02:aa:bb:cc:dd:20,02:aa:bb:cc:dd:20,192.0.2.20,02:aa:bb:cc:dd:20,02aabbccdd20' "$config"
-grep -qx 'ft_peer=02:aa:bb:cc:dd:30,02:aa:bb:cc:dd:30,192.0.2.20,02:aa:bb:cc:dd:30,02aabbccdd30' "$config"
+grep -qx 'ft_peer=02:aa:bb:cc:dd:20,02:aa:bb:cc:dd:20,192.168.1.2,02:aa:bb:cc:dd:20,02aabbccdd20' "$config"
+grep -qx 'ft_peer=02:aa:bb:cc:dd:30,02:aa:bb:cc:dd:30,192.168.1.2,02:aa:bb:cc:dd:30,02aabbccdd30' "$config"
 grep -q "mobility_domain='4b4e'" "$openwrt"
 grep -q "replace_entry 'default_radio0' r0kh '02:11:22:33:44:50,Keenetic:02:11:22:33:44:51-10,'" "$openwrt"
 grep -q "replace_entry 'default_radio1' r1kh '02:11:22:33:44:50,02:11:22:33:45:50,'" "$openwrt"
@@ -70,6 +70,8 @@ grep -q 'wireless.default_radio0.ieee80211r=1' "$openwrt"
 grep -q 'wireless.default_radio1.ieee80211r=1' "$openwrt"
 grep -q "02:aa:bb:cc:dd:30,02aabbccdd30" "$openwrt"
 grep -q 'TCP-LISTEN:3517' "$openwrt"
+grep -q 'procd_set_param respawn 3600 5 0' "$openwrt"
+grep -q '/etc/init.d/keensteer-rrb-sink status' "$openwrt"
 grep -Eq '^[0-9a-f]{64}$' "$key"
 [ "$(stat -c '%a' "$key")" = 600 ]
 dash -n "$openwrt"
