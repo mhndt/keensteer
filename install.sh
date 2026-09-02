@@ -20,6 +20,11 @@ if [ ! -d "$root/etc/init.d" ]; then
 	exit 1
 fi
 
+had_config=0
+if [ -e "$root/etc/keensteer.conf" ]; then
+	had_config=1
+fi
+
 if [ ! -x keensteerd ]; then
 	echo "Prebuilt target binary not found: ./keensteerd" >&2
 	exit 1
@@ -48,7 +53,14 @@ fi
 trap - EXIT HUP INT TERM
 
 echo "Installed $root/sbin/keensteerd"
-echo "Existing configuration and keys were preserved."
-if [ -z "$destdir" ]; then
-	echo "Run $root/sbin/keensteer-setup to configure roaming."
+if [ "$had_config" -eq 1 ]; then
+	echo "Existing configuration and keys were preserved."
+	if [ -z "$destdir" ]; then
+		echo "Restart with: $root/etc/init.d/S99keensteer restart"
+	fi
+else
+	echo "Created $root/etc/keensteer.conf"
+	if [ -z "$destdir" ]; then
+		echo "Run $root/sbin/keensteer-setup to configure roaming."
+	fi
 fi

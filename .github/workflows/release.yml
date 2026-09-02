@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags: ['v*']
 
@@ -18,7 +19,9 @@ jobs:
           header_version=$(sed -n 's/^#define KS_VERSION "\([^"]*\)"/\1/p' include/keensteer.h)
           make_version=$(sed -n 's/^VERSION[[:space:]]*=[[:space:]]*//p' Makefile)
           test "$header_version" = "$make_version"
-          test "v$header_version" = "$GITHUB_REF_NAME"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            test "v$header_version" = "$GITHUB_REF_NAME"
+          fi
       - run: make test
       - name: Check shell scripts
         run: |
@@ -27,6 +30,7 @@ jobs:
           done
 
   mips:
+    needs: check
     runs-on: ubuntu-latest
     container:
       image: waujito/entware_builder:mips-3.4
@@ -38,8 +42,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version=${GITHUB_REF_NAME#v}
           src=$GITHUB_WORKSPACE
+          version=$(sed -n 's/^VERSION[[:space:]]*=[[:space:]]*//p' "$src/Makefile")
+          test -n "$version"
 
           mkdir -p package/keensteer
           cat > package/keensteer/Makefile <<'MAKEFILE'
@@ -116,6 +121,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    if: github.event_name == 'push'
     needs: [check, mips]
     runs-on: ubuntu-latest
     permissions:

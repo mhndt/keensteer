@@ -47,11 +47,13 @@ a3  4  reassociation value
 
 The supported selectors are `00 0f ac 04` (CCMP) and `00 0f ac 09` (FT-SAE). The tested insert uses reassociation value 20.
 
-EtherType `0xeeee` signal `0x50` has an 11-byte body. The receive ifindex selects the source BSS and the STA starts at frame offset `0x34`. A query clears PMKR0Name and supplies the configured local R0KH-ID and actual target R1KH-ID. The tested `FT_QueryKeyInfoForKDP()` overwrites the response R0KH-ID from the selected BSS; it must equal the request identity, which detects selection of another local BSS.
+EtherType `0xeeee` signal `0x50` has an 11-byte body. The receive ifindex selects the source BSS and the STA starts at frame offset `0x34`. The prewarm query generated from signal `0x50` clears PMKR0Name and supplies the configured local R0KH-ID and actual target R1KH-ID. The ioctl interface supplies the initial BSS, but a normal live station entry overrides it with the station's BSS index. `FT_QueryKeyInfoForKDP()` looks up the type-1 cache entry by effective BSS and STA; zero PMKR0Name accepts that entry and nonzero PMKR0Name must match it exactly. Request R0KH-ID is not a lookup key. The response R0KH-ID is overwritten from the effective BSS and must equal the request identity, which detects selection of another local BSS.
 
 Signal `0xa0` carries a target cache-miss element at `0x32`. The tested constructor zeroes the element, then writes the header, STA, nonzero PMKR0Name, target R1KH and equal S1KH. It does not populate R0KH MAC or R0KH-ID. A request without R0KH-ID is sent to each configured compatible R0 peer, bounded by the peer and pending-table limits; the first authenticated matching response consumes the group. A variant supplying a nonzero R0KH-ID must match exactly one configured peer. Signal `0xa1` carries correlation bytes at `0x2e` and the response element at `0x32`. It must match correlation, source ifindex, STA, S1KH, local R0KH-ID, local R0KH MAC, target R1KH and deadline before it is consumed.
 
 The wrapper IPv4 is configured trusted peer metadata. For `0x8409`, mtkiappd also sends an opaque native duplicate to that IPv4 on TCP/3517; the configured sink must accept, drain and close without interpreting it. Sinks are rechecked one at a time every 30 seconds in both states. For `0x840a`, the same IPv4 records the actual OpenWrt R0/source owner.
+
+MediaTek ioctl `0x8bea` returns an eight-byte per-radio channel-utilization record. Byte 1 is the bandwidth enum, byte 2 is the primary channel, byte 3 is the secondary or center channel and byte 6 is channel load in percent. keensteer samples it every three seconds and accepts values only when the returned length, bandwidth, primary channel and percentage are valid; otherwise load is zero.
 
 The AF_PACKET socket uses `ETH_P_ALL` because that is the observation path validated on the tested firmware. keensteer does not register as mtkiappd or bndstrg.
 
@@ -67,6 +69,8 @@ RRB uses EtherType `0x88b7`, OUI wrapper `00 13 74 00 01`, and subtype 1 through
 
 PULL authenticated TLVs are NONCE, SEQ, R0KH-ID and R1KH-ID; PMKR0Name and S1KH-ID are encrypted. RESP authenticates the same identities and nonce, and encrypts S1KH-ID, PMK-R1, PMKR1Name, pairwise and lifetime. PUSH authenticates SEQ, R0KH-ID and R1KH-ID and additionally encrypts PMKR0Name. AES-SIV associated data is source Ethernet MAC, the complete authenticated TLV bytes, then the subtype byte.
 
+An incoming PULL selects one configured peer by source MAC and R1KH-ID and one local BSS by R0KH-ID. After replay acceptance, its exact nonzero PMKR0Name and S1KH-ID are submitted through `0x8409` on that BSS and the response checks fail closed if the driver selects another BSS. The pending KDP tuple is source BSS, peer, STA and target R1KH; retries with the same nonce are deduplicated and conflicting requests do not replace it. A matching `0xa1` sends RESP instead of PUSH.
+
 Hostapd legacy 16-byte RKH keys are expanded as the first HMAC-SHA256 block over `FT OLDKEY`, including its terminating NUL, followed by counter byte 1. A native 32-byte RKH key is used directly, matching current hostapd's fixed key storage.
 
 Sequence state is bounded per configured peer. Timestamps use monotonic seconds, the replay backlog is 16 sequence numbers, unknown domains or ambiguous windows trigger authenticated SEQ_REQ/SEQ_RESP synchronization, and duplicates/old values are rejected. Pending frames and nonces expire after ten seconds.
@@ -76,3 +80,5 @@ pairwise or expiry is a hostapd cache miss. It clears the matching pending
 PULL without issuing `0x840a`. If any of those four fields is present, all
 four must be present once with the exact expected lengths; partial, duplicate
 or malformed records are rejected.
+
+For an incoming PULL, synchronous `0x8409` failure or expiry produces the same S1KH-only RESP. A positive response echoes the PULL nonce and identities and uses a fresh transmit sequence.

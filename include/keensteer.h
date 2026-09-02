@@ -9,7 +9,7 @@
 #include <linux/if.h>
 #include <netinet/in.h>
 
-#define KS_VERSION "1.0.0"
+#define KS_VERSION "1.0.1"
 
 #define KS_MAX_BSS             8
 #define KS_MAX_STA           256
@@ -27,6 +27,7 @@
 #define KS_ETH_P_RRB      0x88b7
 #define KS_ETH_P_MTK_KDP  0xeeee
 #define KS_MTK_PRIV_IOCTL 0x8be1
+#define KS_MTK_LOAD_IOCTL 0x8bea
 #define KS_OID_FT_QUERY   0x8409
 #define KS_OID_FT_INSERT  0x840a
 
@@ -133,8 +134,11 @@ struct ks_kdp_element {
 
 struct ks_kdp_pending {
 	bool used;
+	bool rrb_pull;
 	uint32_t correlation;
+	uint8_t nonce[16];
 	uint8_t sta[6];
+	uint8_t pmkr0name[16];
 	uint8_t target_r1kh[6];
 	int source_bss;
 	int source_ifindex;
@@ -179,6 +183,7 @@ struct ks_state {
 	int transport_ifindex;
 	uint8_t transport_mac[6];
 	uint64_t next_usteer_ms;
+	uint64_t next_load_ms;
 	uint64_t next_sink_probe_ms;
 	unsigned int sink_probe_cursor;
 	bool stop;
@@ -242,6 +247,7 @@ void ks_usteer_expire(struct ks_state *s, uint64_t now);
 int ks_backend_open(struct ks_state *s);
 void ks_backend_close(struct ks_state *s);
 void ks_backend_reprobe(struct ks_state *s, uint64_t now);
+void ks_backend_update_load(struct ks_state *s);
 int ks_backend_handle_packet(struct ks_state *s);
 int ks_backend_handle_netlink(struct ks_state *s);
 int ks_backend_ft_query(struct ks_state *s, int bss_index,
@@ -280,6 +286,9 @@ int ks_kdp_build_wrapper(uint32_t correlation,
 			 uint8_t out[KS_KDP_WRAPPER_LEN]);
 int ks_kdp_prewarm_event(struct ks_state *s, int source_bss,
 			 const struct ks_kdp_element *event);
+int ks_kdp_pull_request(struct ks_state *s, int source_bss, int peer_index,
+			const uint8_t nonce[16], const uint8_t sta[6],
+			const uint8_t pmkr0name[16]);
 int ks_kdp_handle_response(struct ks_state *s, int ifindex,
 			   uint32_t correlation,
 			   const struct ks_kdp_element *response);
@@ -318,6 +327,9 @@ int ks_rrb_handle_frame(struct ks_state *s, const uint8_t *frame, size_t len);
 int ks_rrb_send_push(struct ks_state *s, int peer_index,
 		     const struct ks_kdp_element *element);
 int ks_rrb_send_pull(struct ks_state *s, int target_bss,
+		     const struct ks_kdp_element *element);
+int ks_rrb_send_resp(struct ks_state *s, int peer_index, int source_bss,
+		     const uint8_t nonce[16], const uint8_t sta[6],
 		     const struct ks_kdp_element *element);
 void ks_rrb_expire(struct ks_state *s, uint64_t now);
 

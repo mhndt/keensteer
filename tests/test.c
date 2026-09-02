@@ -26,6 +26,10 @@ struct attr {
 };
 
 static bool mock_wext;
+static bool mock_load_error;
+static uint8_t mock_load[8];
+static uint16_t mock_load_len;
+static unsigned int mock_load_calls;
 
 int __real_ioctl(int fd, unsigned long request, ...);
 int __wrap_ioctl(int fd, unsigned long request, ...);
@@ -60,6 +64,12 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
 	case SIOCGIWPRIV:
 		((struct iw_priv_args *) wrq->u.data.pointer)[0].cmd = SIOCIWFIRSTPRIV + 2;
 		wrq->u.data.length = 1;
+		return 0;
+	case KS_MTK_LOAD_IOCTL:
+		mock_load_calls++;
+		if (mock_load_error) { errno = EOPNOTSUPP; return -1; }
+		memcpy(wrq->u.data.pointer, mock_load, sizeof(mock_load));
+		wrq->u.data.length = mock_load_len;
 		return 0;
 	default:
 		errno = EOPNOTSUPP;
@@ -159,6 +169,25 @@ static void kdp_request(struct ks_kdp_element *e, const uint8_t sta[6],
 	memcpy(e->raw + 0x57, sta, 6);
 }
 
+static int pull_frame(const uint8_t key[32], const uint8_t src[6],
+		      const uint8_t dst[6], const uint8_t nonce[16],
+		      const uint8_t seq[12], const uint8_t *r0, size_t r0n,
+		      const uint8_t r1[6], const uint8_t n0[16],
+		      const uint8_t sta[6], uint8_t *frame, size_t *flen)
+{
+	uint8_t auth[256], plain[128];
+	size_t alen = 0, plen = 0;
+
+	if (put_tlv(auth, sizeof(auth), &alen, 2, nonce, 16) ||
+	    put_tlv(auth, sizeof(auth), &alen, 1, seq, 12) ||
+	    put_tlv(auth, sizeof(auth), &alen, 4, r0, r0n) ||
+	    put_tlv(auth, sizeof(auth), &alen, 5, r1, 6) ||
+	    put_tlv(plain, sizeof(plain), &plen, 7, n0, 16) ||
+	    put_tlv(plain, sizeof(plain), &plen, 6, sta, 6)) return -1;
+	return ks_rrb_build(1, src, dst, key, auth, alen, plain, plen,
+			    frame, 768, flen);
+}
+
 static void sample_state(struct ks_state *s, unsigned int nodes)
 {
 	static const uint8_t bssid[][6] = {
@@ -184,8 +213,9 @@ static void sample_state(struct ks_state *s, unsigned int nodes)
 		b->channel = i ? 36 : 1;
 		b->op_class = i ? 115 : 81;
 		b->band = i ? KS_BAND_5GHZ : KS_BAND_2GHZ;
-		b->noise = -95;
-		b->max_assoc = 64;
+		b->noise = 0;
+		b->load = 0;
+		b->max_assoc = 0;
 	}
 	st = &s->stations[0];
 	st->used = st->connected = st->seen_2ghz = true;
@@ -222,6 +252,7 @@ static int test_usteer(void)
 	unsigned int nodes = 0;
 
 	sample_state(&tx, 2);
+	tx.cfg.bss[0].load = 37;
 	CHECK(!ks_usteer_encode(&tx, buf, sizeof(buf), &len));
 	CHECK(!first_station(buf, len, &sta, &node));
 	CHECK(find_attr(sta.data, sta.len, 0, 6, &a) == 1);
@@ -233,6 +264,9 @@ static int test_usteer(void)
 	CHECK(find_attr(sta.data, sta.len, 5, 1, &a) == 1 && a.data[0] == 1);
 	CHECK(find_attr(sta.data, sta.len, 6, 1, &a) == 1 && a.data[0] == 0);
 	CHECK(find_attr(sta.data, sta.len, 7, 4, &a) == 1 && ks_get_be32(a.data) == 0);
+	CHECK(find_attr(node.data, node.len, 4, 4, &a) == 1 && ks_get_be32(a.data) == 0);
+	CHECK(find_attr(node.data, node.len, 5, 4, &a) == 1 && ks_get_be32(a.data) == 37);
+	CHECK(find_attr(node.data, node.len, 7, 4, &a) == 1 && ks_get_be32(a.data) == 0);
 	CHECK(find_attr(node.data, node.len, 8, 0, &rrm) == 1);
 	off = 0;
 	CHECK(!next_attr(rrm.data, rrm.len, &off, &array) && array.id == 1 && array.len >= 4);
@@ -334,6 +368,12 @@ static int test_config(void)
 		"ft=1\n"
 		"ft_peer=02:00:00:00:00:20,02:00:00:00:00:21,192.0.2.20,,remote-r0\n"
 		"ft_peer=02:00:00:00:00:30,02:00:00:00:00:31,192.0.2.30,,remote-r0\n";
+	static const char duplicate_local[] =
+		"interface=eth0\n"
+		"ft=1\n"
+		"bss=wlan0,node0,ess,02:00:00:00:00:10,1,81,,keenetic-r0\n"
+		"bss=wlan1,node1,ess,02:00:00:00:00:11,36,115,,keenetic-r0\n"
+		"ft_peer=02:00:00:00:00:20,02:00:00:00:00:21,192.0.2.20,,remote-r0\n";
 	struct ks_config cfg;
 	char path[] = "/tmp/keensteer-config-XXXXXX", err[128];
 	int fd = mkstemp(path);
@@ -344,7 +384,8 @@ static int test_config(void)
 	CHECK(!ks_config_load(&cfg, path, err, sizeof(err)));
 	CHECK(!strcmp(cfg.transport_if, "eth0") && cfg.n_bss == 1 &&
 	      cfg.n_ft_peers == 1 && cfg.ft_peers[0].r0kh_id_len == 9 &&
-	      cfg.bss[0].r0kh_id_len == 11);
+	      cfg.bss[0].r0kh_id_len == 11 && !cfg.bss[0].noise &&
+	      !cfg.bss[0].load && !cfg.bss[0].max_assoc);
 	fd = open(path, O_WRONLY | O_TRUNC);
 	CHECK(fd >= 0 && write(fd, bad, sizeof(bad) - 1) == (ssize_t) sizeof(bad) - 1);
 	CHECK(!close(fd)); ks_config_defaults(&cfg);
@@ -352,6 +393,11 @@ static int test_config(void)
 	fd = open(path, O_WRONLY | O_TRUNC);
 	CHECK(fd >= 0 && write(fd, duplicate, sizeof(duplicate) - 1) ==
 	      (ssize_t) sizeof(duplicate) - 1);
+	CHECK(!close(fd)); ks_config_defaults(&cfg);
+	CHECK(ks_config_load(&cfg, path, err, sizeof(err)) < 0);
+	fd = open(path, O_WRONLY | O_TRUNC);
+	CHECK(fd >= 0 && write(fd, duplicate_local, sizeof(duplicate_local) - 1) ==
+	      (ssize_t) sizeof(duplicate_local) - 1);
 	CHECK(!close(fd)); ks_config_defaults(&cfg);
 	CHECK(ks_config_load(&cfg, path, err, sizeof(err)) < 0);
 	CHECK(!unlink(path));
@@ -370,7 +416,25 @@ static int test_config(void)
 		b->op_class = 128; b->band = KS_BAND_5GHZ;
 		mock_wext = true; CHECK(!ks_topology_discover(&s)); mock_wext = false;
 		CHECK(b->active && b->mtk_kdp && b->channel == 44 &&
-		      !strcmp(b->ssid, "live-ess"));
+		      !strcmp(b->ssid, "live-ess") && !b->noise && !b->load &&
+		      !b->max_assoc);
+		memcpy(mock_load, (uint8_t[]) { 1, 0, 44, 149, 0, 1, 37, 0 }, 8);
+		mock_load_len = 8; mock_load_error = false; mock_load_calls = 0;
+		s.ioctl_fd = 1; s.next_load_ms = 0; mock_wext = true;
+		ks_backend_update_load(&s);
+		CHECK(b->load == 37 && mock_load_calls == 1);
+		ks_backend_update_load(&s); CHECK(mock_load_calls == 1);
+		s.next_load_ms = 0; mock_load[2] = 36; ks_backend_update_load(&s);
+		CHECK(!b->load);
+		s.next_load_ms = 0; mock_load[2] = 44; mock_load[1] = 5;
+		ks_backend_update_load(&s); CHECK(!b->load);
+		s.next_load_ms = 0; mock_load[1] = 2; mock_load[6] = 101;
+		ks_backend_update_load(&s); CHECK(!b->load);
+		s.next_load_ms = 0; mock_load[6] = 12; mock_load_len = 7;
+		ks_backend_update_load(&s); CHECK(!b->load);
+		s.next_load_ms = 0; mock_load_len = 8; mock_load_error = true;
+		ks_backend_update_load(&s); CHECK(!b->load);
+		mock_wext = false;
 	}
 	return 0;
 }
@@ -788,6 +852,281 @@ static int test_rrb_pull_resp(void)
 	return 0;
 }
 
+static int test_rrb_incoming_pull(void)
+{
+	static const char r0[] = "Keenetic:02:00:00:00:00:11-00";
+	static const char other_r0[] = "Keenetic:02:00:00:00:00:12-00";
+	uint8_t key[32], local[6] = { 0x02, 2, 2, 2, 2, 2 };
+	uint8_t local_bss[6] = { 0x02, 2, 2, 2, 2, 3 };
+	uint8_t remote[6] = { 0x02, 1, 1, 1, 1, 1 };
+	uint8_t remote2[6] = { 0x02, 1, 1, 1, 1, 2 };
+	uint8_t r1[6] = { 0x02, 3, 3, 3, 3, 3 };
+	uint8_t r1b[6] = { 0x02, 3, 3, 3, 3, 4 };
+	uint8_t sta[6] = { 0x02, 4, 4, 4, 4, 4 };
+	uint8_t bad_sta[6] = { 0x01, 4, 4, 4, 4, 4 };
+	uint8_t nonce[16], nonce2[16], n0[16], n0b[16], n1[16], pmk[32];
+	uint8_t seq[12], seqb[12], auth[256], plain[256], frame[768];
+	uint8_t wrapper[KS_KDP_WRAPPER_LEN];
+	const uint8_t *v;
+	struct ks_rrb_message msg;
+	struct ks_rrb_plain dec;
+	struct ks_kdp_element assoc, response, response_b;
+	struct ks_state base, s;
+	uint32_t corr;
+	uint16_t oid;
+	unsigned int rrb_count, ioctl_count;
+	int ioctl_bss;
+	size_t alen, plen, flen, i, n, pending;
+
+	for (i = 0; i < sizeof(key); i++) key[i] = (uint8_t) (i + 1);
+	for (i = 0; i < sizeof(nonce); i++) {
+		nonce[i] = (uint8_t) (i + 0x10); nonce2[i] = (uint8_t) (i + 0x30);
+		n0[i] = (uint8_t) (i + 0x50); n0b[i] = (uint8_t) (i + 0x70);
+		n1[i] = (uint8_t) (i + 0x90);
+	}
+	for (i = 0; i < sizeof(pmk); i++) pmk[i] = (uint8_t) (i + 0xa0);
+	CHECK(inet_pton(AF_INET, "192.0.2.22", &corr) == 1);
+	memset(&base, 0, sizeof(base)); ks_config_defaults(&base.cfg);
+	base.cfg.ft_enabled = true; base.rrb_key_loaded = true;
+	memcpy(base.rrb_key, key, sizeof(key)); memcpy(base.transport_mac, local, 6);
+	base.packet_fd = base.ioctl_fd = -2; base.transport_ifindex = 1;
+	base.cfg.n_bss = 2; base.cfg.bss[0].active = base.cfg.bss[0].mtk_kdp = true;
+	base.cfg.bss[0].ifindex = 9; memcpy(base.cfg.bss[0].bssid, local_bss, 6);
+	memcpy(base.cfg.bss[0].r1kh_id, local_bss, 6);
+	memcpy(base.cfg.bss[0].r0kh_id, r0, sizeof(r0) - 1);
+	base.cfg.bss[0].r0kh_id_len = sizeof(r0) - 1;
+	base.cfg.bss[1].active = base.cfg.bss[1].mtk_kdp = true;
+	base.cfg.bss[1].ifindex = 10;
+	memcpy(base.cfg.bss[1].bssid, (uint8_t[]) { 0x02, 2, 2, 2, 2, 4 }, 6);
+	memcpy(base.cfg.bss[1].r0kh_id, other_r0, sizeof(other_r0) - 1);
+	base.cfg.bss[1].r0kh_id_len = sizeof(other_r0) - 1;
+	base.cfg.n_ft_peers = 1; base.cfg.ft_peers[0].used = true;
+	base.cfg.ft_peers[0].sink_ready = true;
+	base.cfg.ft_peers[0].peer_ip.s_addr = corr;
+	memcpy(base.cfg.ft_peers[0].transport, remote, 6);
+	memcpy(base.cfg.ft_peers[0].bssid, remote, 6);
+	memcpy(base.cfg.ft_peers[0].r1kh_id, r1, 6);
+	base.cfg.ft_peers[0].rx_domain = 0x12345679;
+	base.cfg.ft_peers[0].rx_count = 1; base.cfg.ft_peers[0].rx_last[0] = 19;
+	base.cfg.ft_peers[0].tx_domain = 0x87654321;
+	base.cfg.ft_peers[0].tx_seq = 7;
+	ks_put_le32(seq, base.cfg.ft_peers[0].rx_domain); ks_put_le32(seq + 4, 20);
+	ks_put_le32(seq + 8, (uint32_t) (ks_now_ms() / 1000));
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0, sta, frame, &flen));
+
+	s = base; ks_mtk_test_reset();
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	ks_mtk_test_counts(&rrb_count, &ioctl_count);
+	CHECK(!rrb_count && ioctl_count == 1);
+	CHECK(!ks_mtk_test_last_ioctl(&oid, &ioctl_bss, wrapper, sizeof(wrapper), &n));
+	CHECK(oid == KS_OID_FT_QUERY && ioctl_bss == 0 && n == sizeof(wrapper));
+	CHECK(!memcmp(wrapper, &corr, 4) &&
+	      !memcmp(wrapper + 12 + 0x07, sta, 6) &&
+	      wrapper[12 + 0x40] == sizeof(r0) - 1 &&
+	      !memcmp(wrapper + 12 + 0x10, r0, sizeof(r0) - 1) &&
+	      !memcmp(wrapper + 12 + 0x41, n0, 16) &&
+	      !memcmp(wrapper + 12 + 0x51, r1, 6) &&
+	      !memcmp(wrapper + 12 + 0x57, sta, 6));
+	for (pending = 0; pending < KS_MAX_KDP_PENDING; pending++)
+		if (s.kdp_pending[pending].used) break;
+	CHECK(pending < KS_MAX_KDP_PENDING && s.kdp_pending[pending].rrb_pull &&
+	      !memcmp(s.kdp_pending[pending].nonce, nonce, 16) &&
+	      !memcmp(s.kdp_pending[pending].pmkr0name, n0, 16));
+	ks_put_le32(seq + 4, 21);
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0, sta, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	ks_mtk_test_counts(NULL, &ioctl_count); CHECK(ioctl_count == 1);
+	memset(&assoc, 0, sizeof(assoc));
+	memcpy(assoc.raw, "\xff\xff\x00\xa3\x00\x0e\x2e", 7);
+	memcpy(assoc.raw + 0x07, sta, 6); memcpy(assoc.raw + 0x57, sta, 6);
+	CHECK(ks_kdp_prewarm_event(&s, 0, &assoc) == 0 && s.kdp_pending[pending].rrb_pull);
+	ks_put_le32(seq + 4, 20);
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0, sta, frame, &flen));
+	CHECK(ks_rrb_handle_frame(&s, frame, flen) < 0);
+	ks_put_le32(seq + 4, 22);
+	CHECK(!pull_frame(key, remote, local, nonce2, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0b, sta, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	ks_mtk_test_counts(&rrb_count, &ioctl_count);
+	CHECK(rrb_count == 1 && ioctl_count == 1 && s.kdp_pending[pending].used &&
+	      !memcmp(s.kdp_pending[pending].nonce, nonce, 16));
+	CHECK(!ks_kdp_from_rrb(&response, sta, (const uint8_t *) r0, sizeof(r0) - 1,
+			       n0, r1, n1, pmk, local_bss, 0x10, 120));
+	CHECK(!ks_kdp_handle_response(&s, 9, corr ^ 1, &response) &&
+	      s.kdp_pending[pending].used);
+	response.raw[0x41] ^= 1;
+	CHECK(!ks_kdp_handle_response(&s, 9, corr, &response) &&
+	      s.kdp_pending[pending].used);
+	response.raw[0x41] ^= 1;
+	CHECK(!ks_kdp_handle_response(&s, 9, corr, &response));
+	CHECK(!s.kdp_pending[pending].used);
+	ks_mtk_test_counts(&rrb_count, &ioctl_count);
+	CHECK(rrb_count == 2 && ioctl_count == 1);
+	CHECK(!ks_mtk_test_last_rrb(frame, sizeof(frame), &flen));
+	CHECK(!ks_rrb_parse_frame(frame, flen, &msg) && msg.subtype == 2 &&
+	      !memcmp(msg.src, local, 6) && !memcmp(msg.dst, remote, 6));
+	CHECK(get_tlv(msg.auth, msg.auth_len, 2, &v, &n) == 1 && n == 16 &&
+	      !memcmp(v, nonce, 16));
+	CHECK(get_tlv(msg.auth, msg.auth_len, 1, &v, &n) == 1 && n == 12 &&
+	      ks_get_le32(v) == base.cfg.ft_peers[0].tx_domain && ks_get_le32(v + 4) == 8);
+	CHECK(get_tlv(msg.auth, msg.auth_len, 4, &v, &n) == 1 && n == sizeof(r0) - 1 &&
+	      !memcmp(v, r0, n));
+	CHECK(get_tlv(msg.auth, msg.auth_len, 5, &v, &n) == 1 && n == 6 && !memcmp(v, r1, 6));
+	CHECK(!ks_rrb_decrypt(key, &msg, &dec));
+	CHECK(get_tlv(dec.data, dec.len, 6, &v, &n) == 1 && n == 6 && !memcmp(v, sta, 6));
+	CHECK(get_tlv(dec.data, dec.len, 7, &v, &n) == 0);
+	CHECK(get_tlv(dec.data, dec.len, 10, &v, &n) == 1 && n == 32 && !memcmp(v, pmk, 32));
+	CHECK(get_tlv(dec.data, dec.len, 9, &v, &n) == 1 && n == 16 && !memcmp(v, n1, 16));
+	CHECK(get_tlv(dec.data, dec.len, 11, &v, &n) == 1 && n == 2 && ks_get_le16(v) == 0x10);
+	CHECK(get_tlv(dec.data, dec.len, 12, &v, &n) == 1 && n == 2 && ks_get_le16(v) == 120);
+
+	s = base; s.cfg.ft_peers[0].rx_count = 0; ks_mtk_test_reset();
+	ks_put_le32(seq + 4, 20);
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0, sta, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	ks_mtk_test_counts(&rrb_count, &ioctl_count); CHECK(rrb_count == 1 && !ioctl_count);
+	for (pending = 0; pending < KS_MAX_RRB_PENDING; pending++)
+		if (s.rrb_pending[pending].used) break;
+	CHECK(pending < KS_MAX_RRB_PENDING && s.rrb_pending[pending].subtype == 1);
+	alen = 0; ks_put_le32(seqb, base.cfg.ft_peers[0].rx_domain);
+	ks_put_le32(seqb + 4, 21); ks_put_le32(seqb + 8, (uint32_t) (ks_now_ms() / 1000));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 2, s.rrb_pending[pending].nonce, 16));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 1, seqb, 12));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 4, r0, sizeof(r0) - 1));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 5, r1, 6));
+	CHECK(!ks_rrb_build(5, remote, local, key, auth, alen, NULL, 0,
+			    frame, sizeof(frame), &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	ks_mtk_test_counts(NULL, &ioctl_count); CHECK(ioctl_count == 1);
+
+	s = base; s.ioctl_fd = -1; ks_mtk_test_reset();
+	ks_put_le32(seq + 4, 20);
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0, sta, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	ks_mtk_test_counts(&rrb_count, &ioctl_count); CHECK(rrb_count == 1 && !ioctl_count);
+	CHECK(!ks_mtk_test_last_rrb(frame, sizeof(frame), &flen));
+	CHECK(!ks_rrb_parse_frame(frame, flen, &msg) && msg.subtype == 2);
+	CHECK(get_tlv(msg.auth, msg.auth_len, 2, &v, &n) == 1 && n == 16 &&
+	      !memcmp(v, nonce, 16));
+	CHECK(!ks_rrb_decrypt(key, &msg, &dec));
+	CHECK(get_tlv(dec.data, dec.len, 6, &v, &n) == 1 && n == 6 && !memcmp(v, sta, 6));
+	CHECK(get_tlv(dec.data, dec.len, 10, &v, &n) == 0 &&
+	      get_tlv(dec.data, dec.len, 9, &v, &n) == 0 &&
+	      get_tlv(dec.data, dec.len, 11, &v, &n) == 0 &&
+	      get_tlv(dec.data, dec.len, 12, &v, &n) == 0);
+
+	s = base; ks_mtk_test_reset();
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0, sta, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	for (pending = 0; pending < KS_MAX_KDP_PENDING; pending++)
+		if (s.kdp_pending[pending].used) break;
+	CHECK(pending < KS_MAX_KDP_PENDING);
+	s.kdp_pending[pending].deadline_ms = ks_now_ms();
+	ks_kdp_expire(&s, ks_now_ms());
+	ks_mtk_test_counts(&rrb_count, &ioctl_count);
+	CHECK(rrb_count == 1 && ioctl_count == 1 && !s.kdp_pending[pending].used);
+
+	s = base; ks_mtk_test_reset();
+	CHECK(!pull_frame(key, remote2, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0, sta, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) "unknown", 7,
+			  r1, n0, sta, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1b, n0, sta, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0, sta, frame, &flen));
+	frame[flen - 1] ^= 1; CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, (uint8_t[16]) {0}, sta, frame, &flen));
+	CHECK(ks_rrb_handle_frame(&s, frame, flen) < 0);
+	ks_put_le32(seq + 4, 21);
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0, bad_sta, frame, &flen));
+	CHECK(ks_rrb_handle_frame(&s, frame, flen) < 0);
+	alen = plen = 0; ks_put_le32(seq + 4, 22);
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 2, nonce, 16));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 1, seq, 12));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 4, r0, sizeof(r0) - 1));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 5, r1, 6));
+	CHECK(!put_tlv(plain, sizeof(plain), &plen, 7, n0, 16));
+	CHECK(!put_tlv(plain, sizeof(plain), &plen, 7, n0, 16));
+	CHECK(!put_tlv(plain, sizeof(plain), &plen, 6, sta, 6));
+	CHECK(!ks_rrb_build(1, remote, local, key, auth, alen, plain, plen,
+			    frame, sizeof(frame), &flen));
+	CHECK(ks_rrb_handle_frame(&s, frame, flen) < 0);
+	alen = plen = 0; ks_put_le32(seq + 4, 23);
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 2, nonce, 16));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 1, seq, 12));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 4, r0, sizeof(r0) - 1));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 5, r1, 6));
+	CHECK(!put_tlv(plain, sizeof(plain), &plen, 7, n0, 15));
+	CHECK(!put_tlv(plain, sizeof(plain), &plen, 6, sta, 6));
+	CHECK(!ks_rrb_build(1, remote, local, key, auth, alen, plain, plen,
+			    frame, sizeof(frame), &flen));
+	CHECK(ks_rrb_handle_frame(&s, frame, flen) < 0);
+	alen = plen = 0; ks_put_le32(seq + 4, 24);
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 2, nonce, 15));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 1, seq, 12));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 4, r0, sizeof(r0) - 1));
+	CHECK(!put_tlv(auth, sizeof(auth), &alen, 5, r1, 6));
+	CHECK(!put_tlv(plain, sizeof(plain), &plen, 7, n0, 16));
+	CHECK(!put_tlv(plain, sizeof(plain), &plen, 6, sta, 6));
+	CHECK(!ks_rrb_build(1, remote, local, key, auth, alen, plain, plen,
+			    frame, sizeof(frame), &flen));
+	CHECK(ks_rrb_handle_frame(&s, frame, flen) < 0);
+	ks_mtk_test_counts(&rrb_count, &ioctl_count); CHECK(!rrb_count && !ioctl_count);
+
+	s = base; s.cfg.n_ft_peers = 2; s.cfg.ft_peers[1] = s.cfg.ft_peers[0];
+	memcpy(s.cfg.ft_peers[1].transport, remote2, 6);
+	memcpy(s.cfg.ft_peers[1].bssid, remote2, 6);
+	memcpy(s.cfg.ft_peers[1].r1kh_id, r1b, 6);
+	s.cfg.ft_peers[1].rx_domain = 0x1234567b;
+	s.cfg.ft_peers[1].tx_domain = 0x87654323;
+	ks_mtk_test_reset(); ks_put_le32(seq + 4, 20);
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0, sta, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	ks_put_le32(seqb, s.cfg.ft_peers[1].rx_domain); ks_put_le32(seqb + 4, 20);
+	ks_put_le32(seqb + 8, (uint32_t) (ks_now_ms() / 1000));
+	CHECK(!pull_frame(key, remote2, local, nonce2, seqb, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1b, n0b, sta, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	ks_mtk_test_counts(NULL, &ioctl_count); CHECK(ioctl_count == 2);
+	CHECK(!ks_kdp_from_rrb(&response_b, sta, (const uint8_t *) r0, sizeof(r0) - 1,
+			       n0b, r1b, n1, pmk, local_bss, 0x10, 120));
+	CHECK(!ks_kdp_handle_response(&s, 9, corr, &response_b));
+	CHECK(!ks_mtk_test_last_rrb(frame, sizeof(frame), &flen));
+	CHECK(!ks_rrb_parse_frame(frame, flen, &msg) && !memcmp(msg.dst, remote2, 6));
+	CHECK(!ks_kdp_handle_response(&s, 9, corr, &response));
+	CHECK(!ks_mtk_test_last_rrb(frame, sizeof(frame), &flen));
+	CHECK(!ks_rrb_parse_frame(frame, flen, &msg) && !memcmp(msg.dst, remote, 6));
+	for (i = n = 0; i < KS_MAX_KDP_PENDING; i++) n += s.kdp_pending[i].used;
+	CHECK(!n);
+
+	s = base; ks_mtk_test_reset();
+	for (i = 0; i < KS_MAX_KDP_PENDING; i++) {
+		s.kdp_pending[i].used = true; s.kdp_pending[i].source_bss = 1;
+	}
+	ks_put_le32(seq + 4, 20);
+	CHECK(!pull_frame(key, remote, local, nonce, seq, (const uint8_t *) r0,
+			  sizeof(r0) - 1, r1, n0, sta, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	ks_mtk_test_counts(&rrb_count, &ioctl_count); CHECK(rrb_count == 1 && !ioctl_count);
+	for (i = n = 0; i < KS_MAX_KDP_PENDING; i++) n += s.kdp_pending[i].used;
+	CHECK(n == KS_MAX_KDP_PENDING);
+	ks_secure_clear(pmk, sizeof(pmk));
+	return 0;
+}
+
 static int test_rrb_dedupe(void)
 {
 	struct ks_state s;
@@ -859,6 +1198,8 @@ int main(void)
 	if (test_rrb()) return 1;
 	n++;
 	if (test_rrb_pull_resp()) return 1;
+	n++;
+	if (test_rrb_incoming_pull()) return 1;
 	n++;
 	if (test_rrb_dedupe()) return 1;
 	n++;

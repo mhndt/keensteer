@@ -196,6 +196,7 @@ int ks_usteer_send(struct ks_state *s)
 	int sent = 0, one = 1;
 
 	if (!s->cfg.usteer_enabled || s->udp_fd < 0) return 0;
+	ks_backend_update_load(s);
 	if (ks_usteer_encode(s, buf, sizeof(buf), &len)) return -1;
 	s->usteer_seq++;
 	memset(&dst, 0, sizeof(dst)); dst.sin_family = AF_INET;

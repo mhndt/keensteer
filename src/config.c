@@ -173,7 +173,7 @@ static int add_bss(struct ks_config *cfg, char *s)
 	b->channel = (int) channel; b->op_class = (int) opclass;
 	b->band = channel <= 14 ? KS_BAND_2GHZ : KS_BAND_5GHZ;
 	b->freq = channel == 14 ? 2484 : (channel <= 14 ? 2407 + 5 * (int) channel : 5000 + 5 * (int) channel);
-	b->noise = -95; b->max_assoc = 128; b->active = true;
+	b->noise = 0; b->max_assoc = 0; b->active = true;
 	cfg->n_bss++;
 	return 0;
 }
@@ -244,11 +244,19 @@ value_bad:
 	if (cfg->ft_enabled && !cfg->n_ft_peers) {
 		seterr(err, err_len, "%s: ft requires at least one ft_peer", path); return -1;
 	}
-	if (cfg->ft_enabled) for (size_t i = 0; i < cfg->n_bss; i++)
+	if (cfg->ft_enabled) for (size_t i = 0; i < cfg->n_bss; i++) {
 		if (!cfg->bss[i].r0kh_id_len) {
 			seterr(err, err_len, "%s: ft requires a local R0KH-ID for every bss", path);
 			return -1;
 		}
+		for (size_t j = 0; j < i; j++)
+			if (cfg->bss[i].r0kh_id_len == cfg->bss[j].r0kh_id_len &&
+			    !memcmp(cfg->bss[i].r0kh_id, cfg->bss[j].r0kh_id,
+				    cfg->bss[i].r0kh_id_len)) {
+				seterr(err, err_len, "%s: duplicate local R0KH-ID", path);
+				return -1;
+			}
+	}
 	return 0;
 bad:
 	fclose(f);
@@ -419,8 +427,6 @@ static int discover_one(int fd, struct ks_bss *b)
 	else if (b->channel >= 30 && b->channel <= 177) b->band = KS_BAND_5GHZ;
 	else b->band = KS_BAND_UNKNOWN;
 	if (!b->name[0]) snprintf(b->name, sizeof(b->name), "keenetic.%s", b->ifname);
-	if (!b->max_assoc) b->max_assoc = 128;
-	if (!b->noise) b->noise = -95;
 	b->active = b->ssid[0] && ks_mac_unicast(b->bssid) &&
 		b->band != KS_BAND_UNKNOWN && b->freq && b->channel && b->op_class;
 	b->mtk_kdp = b->active;

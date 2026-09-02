@@ -283,6 +283,52 @@ static int peer_by_message(const struct ks_state *s, const struct ks_rrb_message
 	return found;
 }
 
+static int local_bss_by_r0kh(const struct ks_state *s, const uint8_t *r0,
+			      size_t r0n)
+{
+	int found = -1;
+	size_t i;
+
+	for (i = 0; i < s->cfg.n_bss; i++) {
+		const struct ks_bss *b = &s->cfg.bss[i];
+		if (!b->active || !b->mtk_kdp || b->r0kh_id_len != r0n ||
+		    CRYPTO_memcmp(b->r0kh_id, r0, r0n)) continue;
+		if (found >= 0) return -1;
+		found = (int) i;
+	}
+	return found;
+}
+
+static int pull_message_ids(const struct ks_state *s, int pi,
+			    const struct ks_rrb_message *m, int *bss)
+{
+	const struct ks_ft_peer *peer = &s->cfg.ft_peers[pi];
+	const uint8_t *r0 = NULL, *r1 = NULL;
+	int bi, r0n;
+
+	if (!peer->used || !ks_mac_equal(peer->transport, m->src) ||
+	    (r0n = need(m->auth, m->auth_len, TLV_R0KH_ID, 0, &r0)) < 1 ||
+	    r0n > KS_MAX_R0KH_ID ||
+	    need(m->auth, m->auth_len, TLV_R1KH_ID, 6, &r1) < 0 ||
+	    !ks_mac_equal(peer->r1kh_id, r1) ||
+	    (bi = local_bss_by_r0kh(s, r0, (size_t) r0n)) < 0) return -1;
+	if (bss) *bss = bi;
+	return 0;
+}
+
+static int peer_by_pull(const struct ks_state *s, const struct ks_rrb_message *m)
+{
+	int found = -1;
+	size_t i;
+
+	for (i = 0; i < s->cfg.n_ft_peers; i++) {
+		if (pull_message_ids(s, (int) i, m, NULL)) continue;
+		if (found >= 0) return -1;
+		found = (int) i;
+	}
+	return found;
+}
+
 static int next_seq(struct ks_ft_peer *p, uint8_t out[12])
 {
 	if (!p->tx_domain) {
@@ -385,7 +431,8 @@ static int queue_and_sync(struct ks_state *s, int pi, const struct ks_rrb_messag
 	if (!q || frame_len > sizeof(q->frame) || ks_random(nonce, sizeof(nonce)) ||
 	    (r0n = need(m->auth, m->auth_len, TLV_R0KH_ID, 0, &r0)) < 1 || r0n > KS_MAX_R0KH_ID ||
 	    need(m->auth, m->auth_len, TLV_R1KH_ID, 6, &r1) < 0) return -1;
-	memset(q, 0, sizeof(*q)); q->used = true; memcpy(q->source, m->src, 6); memcpy(q->nonce, nonce, 16);
+	memset(q, 0, sizeof(*q)); q->used = true; q->subtype = m->subtype;
+	memcpy(q->source, m->src, 6); memcpy(q->nonce, nonce, 16);
 	memcpy(q->frame, frame0, frame_len); q->frame_len = frame_len; q->deadline_ms = ks_now_ms() + 10000;
 	if (tlv(&a, TLV_NONCE, nonce, 16) || tlv(&a, TLV_R0KH_ID, r0, r0n) || tlv(&a, TLV_R1KH_ID, r1, 6) ||
 	    ks_rrb_build(RRB_SEQ_REQ, s->transport_mac, m->src, s->rrb_key,
@@ -420,6 +467,23 @@ static int handle_key_record(struct ks_state *s, int pi, const struct ks_rrb_mes
 		ks_secure_clear(&e, sizeof(e)); return -1;
 	}
 	ks_secure_clear(&e, sizeof(e)); return 0;
+}
+
+static int handle_pull(struct ks_state *s, int pi, int source_bss,
+		       const struct ks_rrb_message *m,
+		       const struct ks_rrb_plain *plain)
+{
+	const uint8_t *nonce = NULL, *sta = NULL, *n0 = NULL;
+	uint8_t v = 0;
+	size_t i;
+
+	if (need(m->auth, m->auth_len, TLV_NONCE, 16, &nonce) < 0 ||
+	    need(plain->data, plain->len, TLV_PMKR0_NAME, 16, &n0) < 0 ||
+	    need(plain->data, plain->len, TLV_S1KH_ID, 6, &sta) < 0 ||
+	    !ks_mac_unicast(sta)) return -1;
+	for (i = 0; i < 16; i++) v |= n0[i];
+	if (!v) return -1;
+	return ks_kdp_pull_request(s, source_bss, pi, nonce, sta, n0);
 }
 
 static struct ks_pull_pending *pull_find(struct ks_state *s, int pi,
@@ -518,13 +582,16 @@ static int handle_pull_resp(struct ks_state *s, int pi,
 static int handle_seq_resp(struct ks_state *s, int pi, const struct ks_rrb_message *m)
 {
 	const uint8_t *nonce = NULL, *seq = NULL; size_t i;
-	if (message_ids(s, pi, m, true) ||
-	    need(m->auth, m->auth_len, TLV_NONCE, 16, &nonce) < 0 ||
+	if (need(m->auth, m->auth_len, TLV_NONCE, 16, &nonce) < 0 ||
 	    need(m->auth, m->auth_len, TLV_SEQ, 12, &seq) < 0) return -1;
 	for (i = 0; i < KS_MAX_RRB_PENDING; i++) {
 		struct ks_rrb_pending q;
 		if (!s->rrb_pending[i].used || !ks_mac_equal(s->rrb_pending[i].source, m->src) ||
 		    CRYPTO_memcmp(s->rrb_pending[i].nonce, nonce, 16)) continue;
+		if ((s->rrb_pending[i].subtype == RRB_PULL &&
+		     pull_message_ids(s, pi, m, NULL)) ||
+		    (s->rrb_pending[i].subtype != RRB_PULL &&
+		     message_ids(s, pi, m, true))) return -1;
 		memcpy(&q, &s->rrb_pending[i], sizeof(q)); ks_secure_clear(&s->rrb_pending[i], sizeof(s->rrb_pending[i]));
 		seq_reset(&s->cfg.ft_peers[pi], seq, 1);
 		ks_rrb_handle_frame(s, q.frame, q.frame_len);
@@ -537,7 +604,7 @@ int ks_rrb_handle_frame(struct ks_state *s, const uint8_t *frame, size_t len)
 {
 	struct ks_rrb_message m;
 	struct ks_rrb_plain p;
-	int pi, rc = -1;
+	int bss = -1, pi, rc = -1;
 	const uint8_t *seq = NULL;
 
 	if (!s->cfg.ft_enabled || !s->rrb_key_loaded ||
@@ -547,7 +614,7 @@ int ks_rrb_handle_frame(struct ks_state *s, const uint8_t *frame, size_t len)
 	if (!ks_mac_equal(m.dst, s->transport_mac) &&
 	    ks_bss_by_bssid(s, m.dst) < 0) return 0;
 
-	pi = peer_by_message(s, &m);
+	pi = m.subtype == RRB_PULL ? peer_by_pull(s, &m) : peer_by_message(s, &m);
 	if (pi < 0) return 0;
 
 	if (ks_rrb_decrypt(s->rrb_key, &m, &p)) return 0;
@@ -559,19 +626,26 @@ int ks_rrb_handle_frame(struct ks_state *s, const uint8_t *frame, size_t len)
 	case RRB_SEQ_RESP:
 		rc = handle_seq_resp(s, pi, &m);
 		break;
+	case RRB_PULL:
+		if (pull_message_ids(s, pi, &m, &bss) ||
+		    need(m.auth, m.auth_len, TLV_SEQ, 12, &seq) < 0) break;
+		goto replay;
 	case RRB_PUSH:
 	case RRB_RESP:
 		if (message_ids(s, pi, &m, true) ||
 		    need(m.auth, m.auth_len, TLV_SEQ, 12, &seq) < 0) break;
-
+	replay:
 		rc = seq_check(&s->cfg.ft_peers[pi], seq);
 		if (rc == -2) {
 			rc = queue_and_sync(s, pi, &m, frame, len);
 		} else if (rc == 0) {
 			seq_accept(&s->cfg.ft_peers[pi], seq);
-			rc = m.subtype == RRB_PUSH ?
-			     handle_key_record(s, pi, &m, &p) :
-			     handle_pull_resp(s, pi, &m, &p);
+			if (m.subtype == RRB_PULL)
+				rc = handle_pull(s, pi, bss, &m, &p);
+			else if (m.subtype == RRB_PUSH)
+				rc = handle_key_record(s, pi, &m, &p);
+			else
+				rc = handle_pull_resp(s, pi, &m, &p);
 		}
 		break;
 	default:
@@ -706,6 +780,45 @@ int ks_rrb_send_push(struct ks_state *s, int peer_index, const struct ks_kdp_ele
 	if (ks_backend_send_rrb(s, peer->transport, frame, flen)) goto bad;
 	ks_secure_clear(plain, sizeof(plain)); ks_secure_clear(frame, sizeof(frame)); return 0;
 bad:
+	ks_secure_clear(plain, sizeof(plain)); ks_secure_clear(frame, sizeof(frame)); return -1;
+}
+
+int ks_rrb_send_resp(struct ks_state *s, int peer_index, int source_bss,
+		     const uint8_t nonce[16], const uint8_t sta[6],
+		     const struct ks_kdp_element *e)
+{
+	struct ks_ft_peer *peer;
+	struct ks_bss *bss;
+	uint8_t seq[12], auth[256], plain[256], frame[768], pair[2], expires[2];
+	struct rb a = { auth, sizeof(auth), 0 }, p = { plain, sizeof(plain), 0 };
+	uint32_t life;
+	size_t flen;
+
+	if (!s || !nonce || !sta || peer_index < 0 ||
+	    (size_t) peer_index >= s->cfg.n_ft_peers || source_bss < 0 ||
+	    (size_t) source_bss >= s->cfg.n_bss || !ks_mac_unicast(sta)) return -1;
+	peer = &s->cfg.ft_peers[peer_index]; bss = &s->cfg.bss[source_bss];
+	if (!peer->used || !bss->active || !bss->mtk_kdp || !bss->r0kh_id_len ||
+	    next_seq(peer, seq)) return -1;
+	if (tlv(&a, TLV_NONCE, nonce, 16) || tlv(&a, TLV_SEQ, seq, 12) ||
+	    tlv(&a, TLV_R0KH_ID, bss->r0kh_id, bss->r0kh_id_len) ||
+	    tlv(&a, TLV_R1KH_ID, peer->r1kh_id, 6) ||
+	    tlv(&p, TLV_S1KH_ID, sta, 6)) goto bad_resp;
+	if (e) {
+		if (!ks_mac_equal(ks_kdp_sta(e), sta) ||
+		    !ks_mac_equal(ks_kdp_r1kh(e), peer->r1kh_id)) goto bad_resp;
+		life = ks_kdp_lifetime(e); if (!life) life = 1; if (life > 3600) life = 3600;
+		ks_put_le16(pair, 0x10); ks_put_le16(expires, (uint16_t) life);
+		if (tlv(&p, TLV_PMK_R1, ks_kdp_pmkr1(e), 32) ||
+		    tlv(&p, TLV_PMKR1_NAME, ks_kdp_pmkr1name(e), 16) ||
+		    tlv(&p, TLV_PAIRWISE, pair, 2) ||
+		    tlv(&p, TLV_EXPIRES_IN, expires, 2)) goto bad_resp;
+	}
+	if (ks_rrb_build(RRB_RESP, s->transport_mac, peer->transport, s->rrb_key,
+			 auth, a.len, plain, p.len, frame, sizeof(frame), &flen) ||
+	    ks_backend_send_rrb(s, peer->transport, frame, flen)) goto bad_resp;
+	ks_secure_clear(plain, sizeof(plain)); ks_secure_clear(frame, sizeof(frame)); return 0;
+bad_resp:
 	ks_secure_clear(plain, sizeof(plain)); ks_secure_clear(frame, sizeof(frame)); return -1;
 }
 

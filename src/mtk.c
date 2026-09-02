@@ -28,6 +28,7 @@
 #define BNDSTRG_UPDATE_MAC_OFF 88
 #define BNDSTRG_BAND_5GHZ 1
 #define BNDSTRG_BAND_2GHZ 2
+#define LOAD_UPDATE_MS 3000
 #define SINK_REPROBE_MS 30000
 
 #ifdef KS_TEST
@@ -87,8 +88,9 @@ int ks_backend_open(struct ks_state *s)
 	int one = 1;
 
 	s->udp_fd = s->packet_fd = s->netlink_fd = s->ioctl_fd = -1;
-	if (s->cfg.ft_enabled) {
+	if (s->cfg.ft_enabled || s->cfg.usteer_enabled)
 		s->ioctl_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (s->cfg.ft_enabled) {
 		s->packet_fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ALL));
 		if (s->ioctl_fd < 0 || s->packet_fd < 0 || nonblock(s->packet_fd)) goto bad;
 	}
@@ -122,6 +124,31 @@ int ks_backend_open(struct ks_state *s)
 	return 0;
 bad:
 	ks_backend_close(s); return -1;
+}
+
+void ks_backend_update_load(struct ks_state *s)
+{
+	uint64_t now = ks_now_ms();
+	size_t i;
+
+	if (!s->cfg.usteer_enabled || now < s->next_load_ms) return;
+	s->next_load_ms = now + LOAD_UPDATE_MS;
+	for (i = 0; i < s->cfg.n_bss; i++) {
+		struct ks_bss *b = &s->cfg.bss[i];
+		uint8_t response[8] = {0};
+		struct iwreq wrq;
+
+		b->load = 0;
+		if (!b->active || s->ioctl_fd < 0) continue;
+		memset(&wrq, 0, sizeof(wrq));
+		memcpy(wrq.ifr_name, b->ifname, strlen(b->ifname) + 1);
+		wrq.u.data.pointer = response; wrq.u.data.length = sizeof(response);
+		if (ioctl(s->ioctl_fd, KS_MTK_LOAD_IOCTL, &wrq) < 0 ||
+		    wrq.u.data.length != sizeof(response) || response[1] > 4 ||
+		    response[2] != b->channel || response[6] > 100)
+			continue;
+		b->load = response[6];
+	}
 }
 
 void ks_backend_reprobe(struct ks_state *s, uint64_t now)
@@ -576,6 +603,80 @@ static struct ks_kdp_pending *pending_new(struct ks_state *s)
 	return NULL;
 }
 
+static bool pending_same(const struct ks_kdp_pending *p, int source_bss,
+			 int peer_index, const uint8_t sta[6],
+			 const uint8_t target_r1kh[6])
+{
+	return p->used && p->source_bss == source_bss &&
+		p->peer_index == peer_index && ks_mac_equal(p->sta, sta) &&
+		ks_mac_equal(p->target_r1kh, target_r1kh);
+}
+
+static int pending_miss(struct ks_state *s, struct ks_kdp_pending *p)
+{
+	struct ks_kdp_pending q;
+	int rc;
+
+	if (!p->rrb_pull) { ks_secure_clear(p, sizeof(*p)); return -1; }
+	memcpy(&q, p, sizeof(q)); ks_secure_clear(p, sizeof(*p));
+	rc = ks_rrb_send_resp(s, q.peer_index, q.source_bss, q.nonce, q.sta, NULL);
+	ks_secure_clear(&q, sizeof(q));
+	return rc;
+}
+
+int ks_kdp_pull_request(struct ks_state *s, int source_bss, int peer_index,
+			const uint8_t nonce[16], const uint8_t sta[6],
+			const uint8_t pmkr0name[16])
+{
+	struct ks_kdp_pending *p;
+	struct ks_kdp_element q;
+	struct ks_bss *bss;
+	struct ks_ft_peer *peer;
+	size_t i;
+
+	if (!s || !nonce || !sta || !pmkr0name || source_bss < 0 ||
+	    (size_t) source_bss >= s->cfg.n_bss || peer_index < 0 ||
+	    (size_t) peer_index >= s->cfg.n_ft_peers ||
+	    all_zero(pmkr0name, 16)) return -1;
+	bss = &s->cfg.bss[source_bss]; peer = &s->cfg.ft_peers[peer_index];
+	if (!bss->active || !bss->mtk_kdp || !bss->r0kh_id_len || !peer->used)
+		return -1;
+	for (i = 0; i < KS_MAX_KDP_PENDING; i++) {
+		p = &s->kdp_pending[i];
+		if (!pending_same(p, source_bss, peer_index, sta, peer->r1kh_id)) continue;
+		if (p->rrb_pull) {
+			if (!memcmp(p->nonce, nonce, 16) &&
+			    !memcmp(p->pmkr0name, pmkr0name, 16)) return 0;
+			return ks_rrb_send_resp(s, peer_index, source_bss, nonce, sta, NULL);
+		}
+		ks_secure_clear(p, sizeof(*p));
+	}
+	p = pending_new(s);
+	if (!p)
+		return ks_rrb_send_resp(s, peer_index, source_bss, nonce, sta, NULL);
+	memset(&q, 0, sizeof(q));
+	memcpy(q.raw, "\xff\xff\x00\xa3\x00\x0e\x2e", 7);
+	memcpy(q.raw + KDP_STA, sta, 6);
+	memcpy(q.raw + KDP_R0KH_ID, bss->r0kh_id, bss->r0kh_id_len);
+	q.raw[KDP_R0KH_LEN] = (uint8_t) bss->r0kh_id_len;
+	memcpy(q.raw + KDP_PMKR0NAME, pmkr0name, 16);
+	memcpy(q.raw + KDP_R1KH, peer->r1kh_id, 6);
+	memcpy(q.raw + KDP_S1KH, sta, 6);
+	p->rrb_pull = true; p->correlation = peer->peer_ip.s_addr;
+	memcpy(p->nonce, nonce, 16); memcpy(p->sta, sta, 6);
+	memcpy(p->pmkr0name, pmkr0name, 16);
+	memcpy(p->target_r1kh, peer->r1kh_id, 6);
+	p->source_bss = source_bss; p->source_ifindex = bss->ifindex;
+	p->peer_index = peer_index;
+	p->deadline_ms = ks_now_ms() + s->cfg.kdp_timeout_ms;
+	if (ks_backend_ft_query(s, source_bss, &q, p->correlation)) {
+		ks_secure_clear(p, sizeof(*p)); ks_secure_clear(&q, sizeof(q));
+		return ks_rrb_send_resp(s, peer_index, source_bss, nonce, sta, NULL);
+	}
+	ks_secure_clear(&q, sizeof(q));
+	return 0;
+}
+
 int ks_kdp_prewarm_event(struct ks_state *s, int source_bss,
 			 const struct ks_kdp_element *event)
 {
@@ -590,17 +691,19 @@ int ks_kdp_prewarm_event(struct ks_state *s, int source_bss,
 		struct ks_ft_peer *peer = &s->cfg.ft_peers[i];
 		struct ks_kdp_pending *p;
 		struct ks_kdp_element q;
+		bool blocked = false;
 
 		if (!peer->used || !ks_mac_unicast(peer->r1kh_id) ||
 		    ks_mac_equal(peer->bssid, s->cfg.bss[source_bss].bssid) ||
 		    (peer->learned && peer->ssid[0] &&
 		     strcmp(peer->ssid, s->cfg.bss[source_bss].ssid))) continue;
 		for (j = 0; j < KS_MAX_KDP_PENDING; j++)
-			if (s->kdp_pending[j].used &&
-			    s->kdp_pending[j].source_bss == source_bss &&
-			    ks_mac_equal(s->kdp_pending[j].sta, event->raw + KDP_STA) &&
-			    ks_mac_equal(s->kdp_pending[j].target_r1kh, peer->r1kh_id))
+			if (pending_same(&s->kdp_pending[j], source_bss, (int) i,
+					 event->raw + KDP_STA, peer->r1kh_id)) {
+				if (s->kdp_pending[j].rrb_pull) { blocked = true; break; }
 				ks_secure_clear(&s->kdp_pending[j], sizeof(s->kdp_pending[j]));
+			}
+		if (blocked) continue;
 		p = pending_new(s);
 		if (!p) break;
 		memcpy(&q, event, sizeof(q));
@@ -640,27 +743,34 @@ int ks_kdp_handle_response(struct ks_state *s, int ifindex, uint32_t correlation
 	for (i = 0; i < KS_MAX_KDP_PENDING; i++) {
 		struct ks_kdp_pending *p = &s->kdp_pending[i];
 		const uint8_t *e = response->raw;
-		int peer;
+		struct ks_kdp_pending q;
+		int peer, rc;
 
 		if (!p->used || p->correlation != correlation || p->source_ifindex != ifindex ||
 		    now > p->deadline_ms || !ks_mac_equal(p->sta, e + KDP_STA) ||
 		    !ks_mac_equal(p->sta, e + KDP_S1KH) ||
 		    !ks_mac_equal(p->target_r1kh, e + KDP_R1KH)) continue;
+		if (p->rrb_pull && memcmp(p->pmkr0name, e + KDP_PMKR0NAME, 16))
+			continue;
 		peer = p->peer_index;
 		if (p->source_bss < 0 || (size_t) p->source_bss >= s->cfg.n_bss ||
 		    e[KDP_R0KH_LEN] != s->cfg.bss[p->source_bss].r0kh_id_len ||
 		    memcmp(e + KDP_R0KH_ID, s->cfg.bss[p->source_bss].r0kh_id,
 			   e[KDP_R0KH_LEN]) ||
 		    !ks_mac_equal(e + KDP_R0KH_MAC, s->cfg.bss[p->source_bss].bssid)) {
-			ks_secure_clear(p, sizeof(*p)); return -1;
+			return pending_miss(s, p);
 		}
-		ks_secure_clear(p, sizeof(*p));
 		if (!memcmp(e + KDP_PMKR0NAME, (uint8_t[16]) {0}, 16) ||
 		    !memcmp(e + KDP_PMKR1NAME, (uint8_t[16]) {0}, 16) ||
 		    !memcmp(e + KDP_PMK_R1, (uint8_t[32]) {0}, 32) ||
 		    memcmp(e + KDP_PAIRWISE, ccmp, 4) || memcmp(e + KDP_AKM, ft_sae, 4) ||
-		    !ks_get_le32(e + KDP_LIFETIME)) return -1;
-		return ks_rrb_send_push(s, peer, response);
+		    !ks_get_le32(e + KDP_LIFETIME)) return pending_miss(s, p);
+		memcpy(&q, p, sizeof(q)); ks_secure_clear(p, sizeof(*p));
+		rc = q.rrb_pull ?
+			ks_rrb_send_resp(s, peer, q.source_bss, q.nonce, q.sta, response) :
+			ks_rrb_send_push(s, peer, response);
+		ks_secure_clear(&q, sizeof(q));
+		return rc;
 	}
 	return 0;
 }
@@ -669,8 +779,12 @@ void ks_kdp_expire(struct ks_state *s, uint64_t now)
 {
 	size_t i;
 	for (i = 0; i < KS_MAX_KDP_PENDING; i++)
-		if (s->kdp_pending[i].used && now >= s->kdp_pending[i].deadline_ms)
-			ks_secure_clear(&s->kdp_pending[i], sizeof(s->kdp_pending[i]));
+		if (s->kdp_pending[i].used && now >= s->kdp_pending[i].deadline_ms) {
+			if (s->kdp_pending[i].rrb_pull)
+				(void) pending_miss(s, &s->kdp_pending[i]);
+			else
+				ks_secure_clear(&s->kdp_pending[i], sizeof(s->kdp_pending[i]));
+		}
 }
 
 const uint8_t *ks_kdp_sta(const struct ks_kdp_element *e) { return e->raw + KDP_STA; }
