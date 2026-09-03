@@ -488,6 +488,10 @@ unset rrb_key
 echo
 echo "Wrote $config"
 echo "Configured OpenWrt at$hosts"
-echo
-echo "Start keensteer:"
-echo "  /opt/etc/init.d/S99keensteer restart"
+init=$root/opt/etc/init.d/S99keensteer
+if [ -x "$init" ]; then
+	"$init" restart || echo "keensteer did not start, check: ndmc -c 'show log' | grep -i keensteer"
+else
+	echo "Start keensteer:"
+	echo "  /opt/etc/init.d/S99keensteer restart"
+fi

@@ -105,6 +105,10 @@ if ls "$root/tmp"/keensteer-openwrt-* >/dev/null 2>&1; then
 	exit 1
 fi
 
+mkdir -p "$root/opt/etc/init.d"
+printf '#!/bin/sh\necho "$1" >> "%s"\n' "$root/tmp/init.log" > "$root/opt/etc/init.d/S99keensteer"
+chmod 0755 "$root/opt/etc/init.d/S99keensteer"
+
 printf '192.168.1.2\ny\n192.168.1.3\nn\nKN\ny\n' | \
 	KEENSTEER_ROOT=$root KEENSTEER_NDMC=$root/bin/ndmc \
 	KEENSTEER_SSH=$root/bin/ssh \
@@ -146,6 +150,7 @@ grep -q "replace_entry 'default_radio0' r0kh '02:aa:bb:cc:dd:30,02aabbccdd30,'" 
 [ ! -e "$root/tmp/keensteer-openwrt-192.168.1.2.sh" ]
 [ ! -e "$root/tmp/keensteer-openwrt-192.168.1.3.sh" ]
 grep -Eq '^[0-9a-f]{64}$' "$key"
+grep -qx restart "$root/tmp/init.log"
 [ "$(stat -c '%a' "$key")" = 600 ]
 dash -n "$openwrt" "$openwrt2"
 

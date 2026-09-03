@@ -42,7 +42,7 @@ cd keensteer-1.0.2
 
 The installer puts keensteer under /opt. Existing configuration and keys are left alone when upgrading.
 
-The setup helper discovers the Keenetic radios, configures every matching access point on each OpenWrt host over SSH and writes the keensteer configuration. See [SETUP.md](SETUP.md) for the guided and manual setup paths.
+The setup helper discovers the Keenetic radios, configures every matching access point on each OpenWrt host over SSH, writes the keensteer configuration and starts the daemon. See [SETUP.md](SETUP.md) for the guided and manual setup paths.
 
 # Usage
 
