@@ -34,9 +34,9 @@ Download and install the release:
 ```sh
 cd /opt/tmp
 wget -O keensteer.tar.gz \
-  https://github.com/mhndt/keensteer/releases/download/v1.0.1/keensteer-1.0.1-mips-3.4.tar.gz
+  https://github.com/mhndt/keensteer/releases/download/v1.0.2/keensteer-1.0.2-mips-3.4.tar.gz
 tar -xzf keensteer.tar.gz
-cd keensteer-1.0.1
+cd keensteer-1.0.2
 ./install.sh
 /opt/sbin/keensteer-setup
 ```
