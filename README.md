@@ -17,7 +17,6 @@ On OpenWrt:
 On Keenetic:
 
 - [Entware](https://support.keenetic.com/hero-dsl/kn-2410/en/20980-installing-the-entware-repository-on-a-usb-drive.html)
-- libopenssl from Entware (install.sh installs it when missing)
 
 ## Install
 

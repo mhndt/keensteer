@@ -24,6 +24,11 @@ The helper will ask for your OpenWrt root password.
 
 # Manual setup
 
+```sh
+opkg update
+opkg install libopenssl
+```
+
 The examples use:
 
 | Value | Example |
