@@ -30,6 +30,7 @@ static bool mock_load_error;
 static uint8_t mock_load[8];
 static uint16_t mock_load_len;
 static unsigned int mock_load_calls;
+static int mock_freq_channel = 44;
 static bool mock_priv_error, mock_priv_missing;
 static struct { char ifname[IFNAMSIZ]; const char *text; bool error; } mock_table[2];
 static uint16_t mock_table_len;
@@ -62,7 +63,7 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
 		wrq->u.essid.length = 8;
 		return 0;
 	case SIOCGIWFREQ:
-		wrq->u.freq.m = 44;
+		wrq->u.freq.m = mock_freq_channel;
 		wrq->u.freq.e = 0;
 		return 0;
 	case SIOCGIWPRIV: {
@@ -509,6 +510,12 @@ static int test_config(void)
 		ks_backend_update_load(&s); CHECK(!b->load);
 		s.next_load_ms = 0; mock_load_len = 8; mock_load_error = true;
 		ks_backend_update_load(&s); CHECK(!b->load);
+		mock_load_error = false; s.next_load_ms = 0; mock_load[2] = 36; mock_freq_channel = 36;
+		ks_backend_update_load(&s);
+		CHECK(b->load == 12 && b->channel == 36 && b->freq == 5180 && b->active);
+		s.next_load_ms = 0; mock_load[2] = 40; ks_backend_update_load(&s);
+		CHECK(!b->load && b->channel == 36);
+		mock_freq_channel = 44;
 		mock_wext = false;
 	}
 	return 0;
@@ -1441,8 +1448,9 @@ static int test_reconcile(void)
 	s.next_reconcile_ms = 0;
 	CHECK(ks_backend_reconcile(&s, now) < 0 && !mock_table_calls);
 	memcpy(mock_load, (uint8_t[]) { 0, 1, 1, 5, 0, 1, 23, 0 }, 8);
-	mock_load_len = 8; mock_load_error = false; s.next_load_ms = 0;
+	mock_load_len = 8; mock_load_error = false; s.next_load_ms = 0; s.cfg.bss[1].active = false;
 	ks_backend_update_load(&s); CHECK(s.cfg.bss[0].load == 23);
+	s.cfg.bss[1].active = true;
 	mock_priv_missing = false; s.reconcile_off = false; s.next_reconcile_ms = 0;
 	mock_priv_error = true;
 	CHECK(ks_backend_reconcile(&s, now) < 0 && !s.reconcile_off && !mock_table_calls);

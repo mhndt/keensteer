@@ -168,6 +168,7 @@ int ks_backend_open(struct ks_state *s)
 void ks_backend_update_load(struct ks_state *s)
 {
 	uint64_t now = ks_now_ms();
+	bool rediscovered = false;
 	size_t i;
 
 	if (!s->cfg.usteer_enabled || now < s->next_load_ms) return;
@@ -183,9 +184,13 @@ void ks_backend_update_load(struct ks_state *s)
 		memcpy(wrq.ifr_name, b->ifname, strlen(b->ifname) + 1);
 		wrq.u.data.pointer = response; wrq.u.data.length = sizeof(response);
 		if (ioctl(s->ioctl_fd, KS_MTK_LOAD_IOCTL, &wrq) < 0 ||
-		    wrq.u.data.length != sizeof(response) || response[1] > 4 ||
-		    response[2] != b->channel || response[6] > 100)
+		    wrq.u.data.length != sizeof(response) || response[1] > 4 || response[6] > 100)
 			continue;
+		if (response[2] != b->channel) {
+			/* channel changes such as DFS moves raise no link event */
+			if (rediscovered || ks_topology_discover(s)) continue;
+			rediscovered = true; i = (size_t) -1; continue;
+		}
 		b->load = response[6];
 	}
 }
