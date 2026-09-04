@@ -7,6 +7,7 @@ root=${destdir}/opt
 tmp_binary=$root/sbin/.keensteerd.$$
 tmp_init=$root/etc/init.d/.S99keensteer.$$
 tmp_setup=$root/sbin/.keensteer-setup.$$
+tmp_hdr=$root/sbin/.keensteer-hdr.$$
 
 if [ -z "$destdir" ] && [ "$(id -u)" -ne 0 ]; then
 	echo "install.sh must run as root" >&2
@@ -35,16 +36,17 @@ if [ ! -x keensteerd ]; then
 	exit 1
 fi
 elf_arch() {
-	case "$(dd if="$1" bs=1 skip=5 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')$(dd if="$1" bs=1 skip=18 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')" in
-	020008) echo mips ;;
-	010800) echo mipsel ;;
-	01b700) echo aarch64 ;;
-	*) echo unknown ;;
-	esac
+	{ dd if="$1" bs=1 skip=5 count=1; dd if="$1" bs=1 skip=18 count=2; } > "$tmp_hdr" 2>/dev/null
+	if printf '\002\000\010' | cmp -s - "$tmp_hdr"; then echo mips
+	elif printf '\001\010\000' | cmp -s - "$tmp_hdr"; then echo mipsel
+	elif printf '\001\267\000' | cmp -s - "$tmp_hdr"; then echo aarch64
+	else echo unknown
+	fi
 }
 if [ -x "$root/bin/opkg" ]; then
 	want=$(elf_arch "$root/bin/opkg")
 	have=$(elf_arch keensteerd)
+	rm -f "$tmp_hdr"
 	if [ "$want" != unknown ] && [ "$have" != unknown ] && [ "$want" != "$have" ]; then
 		echo "wrong architecture, use $want" >&2
 		exit 1
