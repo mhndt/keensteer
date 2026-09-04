@@ -34,6 +34,23 @@ if [ ! -x keensteerd ]; then
 	echo "Prebuilt target binary not found: ./keensteerd" >&2
 	exit 1
 fi
+elf_arch() {
+	case "$(dd if="$1" bs=1 skip=5 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')$(dd if="$1" bs=1 skip=18 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')" in
+	020008) echo mips ;;
+	010800) echo mipsel ;;
+	01b700) echo aarch64 ;;
+	*) echo unknown ;;
+	esac
+}
+if [ -x "$root/bin/opkg" ]; then
+	want=$(elf_arch "$root/bin/opkg")
+	have=$(elf_arch keensteerd)
+	if [ "$want" != unknown ] && [ "$have" != unknown ] && [ "$want" != "$have" ]; then
+		echo "wrong architecture, use $want" >&2
+		exit 1
+	fi
+fi
+
 if [ -z "$destdir" ] && [ ! -e "$root/lib/libcrypto.so.3" ]; then
 	echo "Installing libopenssl..."
 	opkg update >/dev/null 2>&1 || true

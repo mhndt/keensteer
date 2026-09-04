@@ -154,4 +154,17 @@ grep -qx restart "$root/tmp/init.log"
 [ "$(stat -c '%a' "$key")" = 600 ]
 dash -n "$openwrt" "$openwrt2"
 
+# single-band models run no band steering daemon: the access points are found without its file
+rm -f "$root/var/run/bndstrg-br0.conf" "$config"
+mkdir -p "$root/sys/class/net/ra1"
+printf '%s\n' 02:11:22:33:44:99 > "$root/sys/class/net/ra1/address"
+printf '192.168.1.2\nn\nKN\ny\n' | \
+	KEENSTEER_ROOT=$root KEENSTEER_NDMC=$root/bin/ndmc \
+	KEENSTEER_SSH=$root/bin/ssh \
+	./files/keensteer-setup >/dev/null
+grep -qx 'bss=ra0,keenetic-hero.2g,example-wifi,02:11:22:33:44:50,10,81,,Keenetic:02:11:22:33:44:51-00' "$config"
+grep -qx 'bss=ra8,keenetic-hero.5g,example-wifi,02:11:22:33:45:50,44,128,,Keenetic:02:11:22:33:44:51-10' "$config"
+if grep -q 'ra1' "$config"; then exit 1; fi
+grep -qx 'interface=br0' "$config"
+
 echo "ok setup"

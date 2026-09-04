@@ -589,6 +589,8 @@ static int test_kdp(void)
 	CHECK(!ks_mtk_test_bndstrg(bnd, sizeof(bnd), bnd_mac, &signal));
 	CHECK(signal == -55 && !memcmp(bnd_mac, sta, 6));
 	CHECK(ks_mtk_test_bndstrg(bnd, sizeof(bnd) - 1, bnd_mac, &signal) < 0);
+	CHECK(!ks_mtk_test_bndstrg(bnd, 104, bnd_mac, &signal) && signal == -55);
+	CHECK(ks_mtk_test_bndstrg(bnd, 103, bnd_mac, &signal) < 0);
 	bnd[0] = 2; CHECK(ks_mtk_test_bndstrg(bnd, sizeof(bnd), bnd_mac, &signal) < 0);
 	bnd[0] = 1; bnd[88] |= 1;
 	CHECK(ks_mtk_test_bndstrg(bnd, sizeof(bnd), bnd_mac, &signal) < 0);

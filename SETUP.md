@@ -354,3 +354,7 @@ uci add_list wireless.$WIFI.r1kh="<other BSSID>,<other BSSID>,$RRB_KEY"
 With several Keenetics, run the setup helper on each one with the same Mobility Domain and the same OpenWrt hosts. Each Keenetic derives its own R0KH IDs from its roaming interface MAC, and the helper only replaces OpenWrt entries carrying that Keenetic's MAC, so the entries of the other Keenetics stay in place. Give each Keenetic a distinct hostname, because the usteer node names are derived from it.
 
 Clients move from OpenWrt to a Keenetic when usteer steers them or when they decide to roam. Clients move from a Keenetic to OpenWrt only when they decide to roam; Keenetic steers between its own bands and does not issue transition requests towards OpenWrt.
+
+# Other segments
+
+The helper configures the Home segment. Another segment, such as the guest network, is served by a second configuration file named `/opt/etc/keensteer-<name>.conf`; the init script starts one daemon per such file next to the Home one. In it, `interface=` names the segment's bridge (`br1` for the first additional segment) and the `bss=` lines describe that segment's access points. Their R0KH IDs follow the same rule as the Home ones with the access point index as the last digit, so `Keenetic:<device FT MAC>-01` and `-11` for `AccessPoint1`. On OpenWrt the segment has to reach the bridge its matching SSID is attached to, with the same 802.11r settings as for the Home SSID.

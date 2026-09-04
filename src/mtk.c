@@ -21,6 +21,7 @@
 
 #define OID_BNDSTRG_MSG 0x0950
 #define BNDSTRG_MSG_LEN 112
+#define BNDSTRG_MSG_LEN_3X 104 /* KeeneticOS 3.x drivers, same field offsets */
 #define BNDSTRG_RSSI_OFF 71
 #define BNDSTRG_MAC_OFF 88
 #define BNDSTRG_UPDATE_ACTION 3
@@ -568,7 +569,7 @@ int ks_backend_handle_packet(struct ks_state *s)
 static int bndstrg_parse(const uint8_t *p, size_t len, uint8_t mac[6], int *signal)
 {
 	int rssi = -127, i;
-	if (len != BNDSTRG_MSG_LEN || (p[0] != 0x01 && p[0] != 0x15) ||
+	if ((len != BNDSTRG_MSG_LEN && len != BNDSTRG_MSG_LEN_3X) || (p[0] != 0x01 && p[0] != 0x15) ||
 	    !ks_mac_unicast(p + BNDSTRG_MAC_OFF)) return -1;
 	for (i = 0; i < 3; i++) { int v = (int8_t) p[BNDSTRG_RSSI_OFF + i]; if (v >= -95 && v <= -30 && v > rssi) rssi = v; }
 	if (rssi == -127) return -1;
@@ -627,7 +628,7 @@ static void bndstrg_event(struct ks_state *s, int ifindex, const uint8_t *p, siz
 	int rssi, bss;
 
 	(void) ifindex;
-	if (len == BNDSTRG_MSG_LEN && p[0] == BNDSTRG_UPDATE_ACTION &&
+	if ((len == BNDSTRG_MSG_LEN || len == BNDSTRG_MSG_LEN_3X) && p[0] == BNDSTRG_UPDATE_ACTION &&
 	    p[BNDSTRG_UPDATE_CONNECTED_OFF] <= 1 &&
 	    ks_mac_unicast(p + BNDSTRG_UPDATE_MAC_OFF)) {
 		bss = bndstrg_bss(s, p[BNDSTRG_BAND_OFF]);

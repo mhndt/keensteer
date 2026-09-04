@@ -97,9 +97,15 @@ opclass()
 
 [ -n "$root" ] || [ "$(id -u)" -eq 0 ] || die "must run as root"
 [ -x "$ndmc" ] || die "ndmc not found"
-[ -r "$bndstrg" ] || die "$bndstrg not found"
-
-transport_if=$(sed -n '1{s/[[:space:]]//g;p;}' "$bndstrg")
+ap_list_known=1
+if [ -r "$bndstrg" ]; then
+	transport_if=$(sed -n '1{s/[[:space:]]//g;p;}' "$bndstrg")
+	ap_ifnames=$(sed -n '3,$p' "$bndstrg")
+else
+	transport_if=br0
+	ap_ifnames=$(ls "$sys_class_net" 2>/dev/null | grep '^ra' || true)
+	ap_list_known=0
+fi
 [ -n "$transport_if" ] || die "cannot find the roaming interface"
 [ -r "$sys_class_net/$transport_if/address" ] || die "interface $transport_if not found"
 transport_mac=$(tr 'A-F' 'a-f' < "$sys_class_net/$transport_if/address")
@@ -114,7 +120,7 @@ openwrt_entries=
 ap_paths=
 found=0
 
-for ifname in $(sed -n '3,$p' "$bndstrg"); do
+for ifname in $ap_ifnames; do
 	[ -r "$sys_class_net/$ifname/address" ] || continue
 	bssid=$(tr 'A-F' 'a-f' < "$sys_class_net/$ifname/address")
 	mac_valid "$bssid" || continue
@@ -133,7 +139,10 @@ for ifname in $(sed -n '3,$p' "$bndstrg"); do
 		fi
 		i=$((i + 1))
 	done
-	[ -n "$radio" ] || die "cannot match $ifname to a Keenetic access point"
+	if [ -z "$radio" ]; then
+		[ "$ap_list_known" -eq 0 ] && continue
+		die "cannot match $ifname to a Keenetic access point"
+	fi
 
 	ssid=$(printf '%s\n' "$ap_output" | sed -n 's/^[[:space:]]*ssid:[[:space:]]*//p' | head -n 1)
 	channel=$(printf '%s\n' "$master_output" | awk '$1 == "channel:" { print $2; exit }')
