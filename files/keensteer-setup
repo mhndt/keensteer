@@ -3,10 +3,8 @@ set -eu
 
 PATH=/opt/sbin:/opt/bin:/sbin:/bin:/usr/sbin:/usr/bin
 root=${KEENSTEER_ROOT:-}
-config=$root/opt/etc/keensteer.conf
 key_path=/opt/etc/keensteer.rrb.key
 key_file=$root$key_path
-bndstrg=$root/var/run/bndstrg-br0.conf
 sys_class_net=$root/sys/class/net
 ndmc=${KEENSTEER_NDMC:-$root/bin/ndmc}
 hosts=
@@ -26,6 +24,22 @@ die()
 	echo "keensteer-setup: $*" >&2
 	exit 1
 }
+
+segment=br0
+while getopts s: opt; do
+	case $opt in
+		s) segment=$OPTARG ;;
+		*) echo "usage: keensteer-setup [-s bridge]" >&2; exit 2 ;;
+	esac
+done
+case $segment in Bridge[0-9]|Bridge[0-9][0-9]) segment=br${segment#Bridge} ;; esac
+case $segment in br[0-9]|br[0-9][0-9]) ;; *) die "segment must be a bridge such as br1" ;; esac
+if [ "$segment" = br0 ]; then
+	config=$root/opt/etc/keensteer.conf
+else
+	config=$root/opt/etc/keensteer-$segment.conf
+fi
+bndstrg=$root/var/run/bndstrg-$segment.conf
 
 ask()
 {
@@ -102,15 +116,32 @@ if [ -r "$bndstrg" ]; then
 	transport_if=$(sed -n '1{s/[[:space:]]//g;p;}' "$bndstrg")
 	ap_ifnames=$(sed -n '3,$p' "$bndstrg")
 else
-	transport_if=br0
-	ap_ifnames=$(ls "$sys_class_net" 2>/dev/null | grep '^ra' || true)
+	transport_if=$segment
+	ap_ifnames=
+	for ifname in $(ls "$sys_class_net" 2>/dev/null | grep '^ra' || true); do
+		[ -e "$sys_class_net/$segment/brif/$ifname" ] || continue
+		ap_ifnames="$ap_ifnames $ifname"
+	done
 	ap_list_known=0
 fi
 [ -n "$transport_if" ] || die "cannot find the roaming interface"
 [ -r "$sys_class_net/$transport_if/address" ] || die "interface $transport_if not found"
 transport_mac=$(tr 'A-F' 'a-f' < "$sys_class_net/$transport_if/address")
 mac_valid "$transport_mac" || die "invalid MAC on $transport_if"
-r0kh_base=$(mac_next "$transport_mac")
+if [ "$segment" = br0 ]; then
+	ft_base_mac=$transport_mac
+else
+	home_bndstrg=$root/var/run/bndstrg-br0.conf
+	if [ -r "$home_bndstrg" ]; then
+		ft_if=$(sed -n '1{s/[[:space:]]//g;p;}' "$home_bndstrg")
+	else
+		ft_if=br0
+	fi
+	[ -r "$sys_class_net/$ft_if/address" ] || die "interface $ft_if not found"
+	ft_base_mac=$(tr 'A-F' 'a-f' < "$sys_class_net/$ft_if/address")
+	mac_valid "$ft_base_mac" || die "invalid MAC on $ft_if"
+fi
+r0kh_base=$(mac_next "$ft_base_mac")
 node_prefix=$("$ndmc" -c 'show system' 2>/dev/null |
 	awk '$1 == "hostname:" { print tolower($2); exit }' | tr -cd 'a-z0-9_-' | cut -c1-40)
 [ -n "$node_prefix" ] || node_prefix=keenetic
@@ -120,44 +151,55 @@ openwrt_entries=
 ap_paths=
 found=0
 
+ap_table=
+radio_table=
+i=0
+while [ "$i" -lt 4 ]; do
+	j=0
+	while [ "$j" -lt 4 ]; do
+		candidate=$("$ndmc" -c "show interface WifiMaster$i/AccessPoint$j" 2>/dev/null || true)
+		candidate_mac=$(printf '%s\n' "$candidate" | awk '$1 == "mac:" { print tolower($2); exit }')
+		if mac_valid "$candidate_mac"; then
+			ssid=$(printf '%s\n' "$candidate" | sed -n 's/^[[:space:]]*ssid:[[:space:]]*//p' | head -n 1)
+			ap_table="$ap_table
+$candidate_mac|$i|$j|$ssid"
+		fi
+		j=$((j + 1))
+	done
+	master_output=$("$ndmc" -c "show interface WifiMaster$i" 2>/dev/null || true)
+	radio_table="$radio_table
+$i|$(printf '%s\n' "$master_output" | awk '$1 == "channel:" { print $2; exit }')|$(printf '%s\n' "$master_output" | awk '$1 == "bandwidth:" { print $2; exit }')"
+	i=$((i + 1))
+done
+
 for ifname in $ap_ifnames; do
 	[ -r "$sys_class_net/$ifname/address" ] || continue
 	bssid=$(tr 'A-F' 'a-f' < "$sys_class_net/$ifname/address")
 	mac_valid "$bssid" || continue
 	radio=
-	ap_output=
-	master_output=
-	i=0
-	while [ "$i" -lt 4 ]; do
-		candidate=$("$ndmc" -c "show interface WifiMaster$i/AccessPoint0" 2>/dev/null || true)
-		candidate_mac=$(printf '%s\n' "$candidate" | awk '$1 == "mac:" { print tolower($2); exit }')
-		if [ "$candidate_mac" = "$bssid" ]; then
-			radio=$i
-			ap_output=$candidate
-			master_output=$("$ndmc" -c "show interface WifiMaster$i" 2>/dev/null || true)
-			break
-		fi
-		i=$((i + 1))
-	done
+	entry=$(printf '%s\n' "$ap_table" | grep -F "$bssid|" | head -n 1)
+	[ -z "$entry" ] || IFS='|' read -r _ radio ap ssid <<EOF2
+$entry
+EOF2
 	if [ -z "$radio" ]; then
 		[ "$ap_list_known" -eq 0 ] && continue
 		die "cannot match $ifname to a Keenetic access point"
 	fi
-
-	ssid=$(printf '%s\n' "$ap_output" | sed -n 's/^[[:space:]]*ssid:[[:space:]]*//p' | head -n 1)
-	channel=$(printf '%s\n' "$master_output" | awk '$1 == "channel:" { print $2; exit }')
-	width=$(printf '%s\n' "$master_output" | awk '$1 == "bandwidth:" { print $2; exit }')
+	IFS='|' read -r _ channel width <<EOF2
+$(printf '%s\n' "$radio_table" | grep "^$radio|")
+EOF2
 	[ -n "$ssid" ] || die "cannot read the SSID for $ifname"
 	case "$ssid" in *','*|'#'*|*'|'*) die "SSID contains a character unsupported by keensteer.conf" ;; esac
 	case "$channel:$width" in *[!0-9:]*) die "cannot read the channel for $ifname" ;; esac
 	op_class=$(opclass "$channel" "$width") || die "unsupported channel or width on $ifname"
 
+	[ "$segment" = br0 ] && node=$node_prefix || node=$node_prefix.$segment
 	if [ "$channel" -le 14 ]; then
-		node=$node_prefix.2g
+		node=$node.2g
 	else
-		node=$node_prefix.5g
+		node=$node.5g
 	fi
-	r0kh_id="Keenetic:$r0kh_base-${radio}0"
+	r0kh_id="Keenetic:$r0kh_base-$radio$ap"
 
 	if [ -n "$bss_lines" ]; then
 		bss_lines="$bss_lines
@@ -169,7 +211,7 @@ for ifname in $ap_ifnames; do
 	fi
 	bss_lines="${bss_lines}bss=$ifname,$node,$ssid,$bssid,$channel,$op_class,,$r0kh_id"
 	openwrt_entries="${openwrt_entries}$bssid|$r0kh_id"
-	ap_paths="${ap_paths}WifiMaster$radio/AccessPoint0"
+	ap_paths="${ap_paths}WifiMaster$radio/AccessPoint$ap"
 	found=$((found + 1))
 done
 
@@ -315,6 +357,7 @@ set -eu
 
 listen_ip='$host'
 mobility_domain='$mdid_hex'
+networks=
 rrb_key='$rrb_key'
 
 die()
@@ -382,6 +425,7 @@ uci set "wireless.$wifi.pmk_r1_push=0"
 uci set "wireless.$wifi.nasid=$nasid"
 uci set "wireless.$wifi.r1_key_holder=$nasid"
 remove_owner '$wifi' '$transport_mac'
+networks="\$networks \$(uci -q get "wireless.$wifi.network" || true)"
 EOF
 
 		printf '%s\n' "$openwrt_entries" |
@@ -411,6 +455,16 @@ EOF
 
 uci commit wireless
 wifi reload
+if uci -q get usteer.@usteer[-1] >/dev/null 2>&1; then
+	for network in $networks; do
+		uci -q get usteer.@usteer[-1].network | grep -qw "$network" ||
+			{ uci add_list "usteer.@usteer[-1].network=$network"; usteer_changed=1; }
+	done
+	if [ "${usteer_changed:-0}" = 1 ]; then
+		uci commit usteer
+		/etc/init.d/usteer restart
+	fi
+fi
 
 tmp=/etc/init.d/.keensteer-rrb-sink.$$
 cat > "$tmp" <<INIT

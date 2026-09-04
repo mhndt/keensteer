@@ -35,6 +35,12 @@ case "$2" in
 	'show interface WifiMaster1/AccessPoint0')
 		printf '              mac: 02:11:22:33:45:50\n             ssid: example-wifi\n'
 		;;
+	'show interface WifiMaster0/AccessPoint1')
+		printf '              mac: 02:11:22:33:44:60\n             ssid: example-guest\n'
+		;;
+	'show interface WifiMaster1/AccessPoint1')
+		printf '              mac: 02:11:22:33:45:60\n             ssid: example-guest\n'
+		;;
 	*) ;;
 esac
 EOF
@@ -56,6 +62,8 @@ case "\$*" in
 		cat >/dev/null
 		printf 'default_radio0|phy0-ap0|example-wifi|02:aa:bb:cc:dd:20\n'
 		printf 'default_radio1|phy1-ap0|example-wifi|02:aa:bb:cc:dd:30\n'
+		printf 'guest_radio0|phy0-ap1|example-guest|02:aa:bb:cc:dd:50
+'
 		;;
 	*)
 		cat > "$root/tmp/applied-\$host.sh"
@@ -154,10 +162,10 @@ grep -qx restart "$root/tmp/init.log"
 [ "$(stat -c '%a' "$key")" = 600 ]
 dash -n "$openwrt" "$openwrt2"
 
-# single-band models run no band steering daemon: the access points are found without its file
+# single-band models run no band steering daemon: the access points are the ports of the Home bridge
 rm -f "$root/var/run/bndstrg-br0.conf" "$config"
-mkdir -p "$root/sys/class/net/ra1"
-printf '%s\n' 02:11:22:33:44:99 > "$root/sys/class/net/ra1/address"
+mkdir -p "$root/sys/class/net/br0/brif/ra0" "$root/sys/class/net/br0/brif/ra8" "$root/sys/class/net/ra1"
+printf '%s\n' 02:11:22:33:44:60 > "$root/sys/class/net/ra1/address"
 printf '192.168.1.2\nn\nKN\ny\n' | \
 	KEENSTEER_ROOT=$root KEENSTEER_NDMC=$root/bin/ndmc \
 	KEENSTEER_SSH=$root/bin/ssh \
@@ -166,5 +174,28 @@ grep -qx 'bss=ra0,keenetic-hero.2g,example-wifi,02:11:22:33:44:50,10,81,,Keeneti
 grep -qx 'bss=ra8,keenetic-hero.5g,example-wifi,02:11:22:33:45:50,44,128,,Keenetic:02:11:22:33:44:51-10' "$config"
 if grep -q 'ra1' "$config"; then exit 1; fi
 grep -qx 'interface=br0' "$config"
+
+# another segment: its access points are the bridge ports of the chosen bridge
+for ifname in br1 ra1 rai1; do mkdir -p "$root/sys/class/net/$ifname"; done
+printf '%s\n' 02:11:22:33:44:70 > "$root/sys/class/net/br1/address"
+printf '%s\n' 02:11:22:33:44:60 > "$root/sys/class/net/ra1/address"
+printf '%s\n' 02:11:22:33:45:60 > "$root/sys/class/net/rai1/address"
+mkdir -p "$root/sys/class/net/br1/brif/ra1" "$root/sys/class/net/br1/brif/rai1"
+printf '192.168.1.2\nn\nKN\ny\n' | \
+	KEENSTEER_ROOT=$root KEENSTEER_NDMC=$root/bin/ndmc \
+	KEENSTEER_SSH=$root/bin/ssh \
+	./files/keensteer-setup -s Bridge1 >/dev/null
+guest=$root/opt/etc/keensteer-br1.conf
+grep -qx 'interface=br1' "$guest"
+grep -qx 'bss=ra1,keenetic-hero.br1.2g,example-guest,02:11:22:33:44:60,10,81,,Keenetic:02:11:22:33:44:51-01' "$guest"
+grep -qx 'bss=rai1,keenetic-hero.br1.5g,example-guest,02:11:22:33:45:60,44,128,,Keenetic:02:11:22:33:44:51-11' "$guest"
+grep -qx 'ft_peer=02:aa:bb:cc:dd:50,02:aa:bb:cc:dd:50,192.168.1.2,02:aa:bb:cc:dd:50,02aabbccdd50' "$guest"
+if grep -q 'example-wifi' "$guest"; then exit 1; fi
+grep -q "replace_entry 'guest_radio0' r0kh '02:11:22:33:44:70,Keenetic:02:11:22:33:44:51-01,'" "$openwrt"
+grep -qF 'usteer.@usteer[-1].network' "$openwrt"
+if grep -q 'default_radio0' "$openwrt"; then exit 1; fi
+grep -qx 'interface=br0' "$config"
+[ "$(stat -c '%a' "$guest")" = 600 ]
+dash -n "$openwrt"
 
 echo "ok setup"
