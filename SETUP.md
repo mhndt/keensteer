@@ -15,7 +15,7 @@ Install keensteer on the Keenetic, then run:
 
 The helper discovers the active Keenetic radios and asks for one or more OpenWrt IPv4 addresses and the Mobility Domain.
 
-It connects to each OpenWrt host over SSH, finds every enabled access point using the same SSID and configures all matching 2.4 GHz and 5 GHz interfaces for 802.11r. OpenWrt radios using other SSIDs are left alone. When several OpenWrt hosts are given, each also receives the R0KH and R1KH entries of the others. The usteer node names are derived from the Keenetic hostname.
+It connects to each OpenWrt host over SSH, finds every enabled access point using the same SSID and configures all matching 2.4 GHz and 5 GHz interfaces for 802.11r. OpenWrt radios using other SSIDs are left alone. When several OpenWrt hosts are given, each also receives the R0KH and R1KH entries of the others. The usteer node names are derived from the Keenetic hostname. Radios that are disabled when the helper runs are left out on both sides; run it again after enabling one.
 
 The helper preserves an existing key or generates a new one, enables 802.11r with the Mobility Domain and 802.11k/v on the Keenetic access points, configures the matching R0KH, R1KH and 802.11k/v settings on OpenWrt, installs the TCP/3517 listener on every host, writes /opt/etc/keensteer.conf and restarts keensteer. Running it again rewrites the configuration and keeps the previous one as keensteer.conf.bak. When rerunning the helper, enter every OpenWrt host you want to keep configured.
 

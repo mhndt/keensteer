@@ -29,17 +29,42 @@ jobs:
             dash -n "$script"
           done
 
-  mips:
+  build:
     needs: check
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: mips-3.4
+            release_arch: mips
+            machine: MIPS
+            data: big endian
+            loader: /opt/lib/ld.so.1
+          - arch: mipsel-3.4
+            release_arch: mipsel
+            machine: MIPS
+            data: little endian
+            loader: /opt/lib/ld.so.1
+          - arch: aarch64-3.10
+            release_arch: aarch64
+            machine: AArch64
+            data: little endian
+            loader: /opt/lib/ld-linux-aarch64.so.1
     container:
-      image: waujito/entware_builder:mips-3.4
+      image: waujito/entware_builder:${{ matrix.arch }}
       options: --user root
     steps:
       - uses: actions/checkout@v4
-      - name: Build mips-3.4 release
+      - name: Build ${{ matrix.arch }} release
         working-directory: /home/me/Entware
         shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          RELEASE_ARCH: ${{ matrix.release_arch }}
+          MACHINE: ${{ matrix.machine }}
+          DATA: ${{ matrix.data }}
+          LOADER: ${{ matrix.loader }}
         run: |
           set -euo pipefail
           src=$GITHUB_WORKSPACE
@@ -97,9 +122,9 @@ jobs:
             -path '*/ipkg-*/keensteer/opt/sbin/keensteerd' -print -quit)
           test -n "$binary"
 
-          readelf -h "$binary" | grep -qi 'MIPS'
-          readelf -h "$binary" | grep -qi 'big endian'
-          readelf -l "$binary" | grep -q '/opt/lib/ld.so.1'
+          readelf -h "$binary" | grep -q "Machine:.*$MACHINE"
+          readelf -h "$binary" | grep -q "$DATA"
+          readelf -l "$binary" | grep -q "$LOADER"
           readelf -d "$binary" | grep -q 'libcrypto.so.3'
 
           out="$src/dist/keensteer-$version"
@@ -111,18 +136,18 @@ jobs:
           chmod 0755 "$out/keensteerd" "$out/install.sh" "$out/uninstall.sh" \
             "$out/files/S99keensteer" "$out/files/keensteer-setup"
 
-          tar -C "$src/dist" -czf "$src/dist/keensteer-$version-mips-3.4.tar.gz" \
+          tar -C "$src/dist" -czf "$src/dist/keensteer-$version-$RELEASE_ARCH.tar.gz" \
             "keensteer-$version"
           rm -rf "$out"
       - uses: actions/upload-artifact@v4
         with:
-          name: keensteer-${{ github.ref_name }}-mips-3.4
-          path: dist/keensteer-*-mips-3.4.tar.gz
+          name: keensteer-${{ github.ref_name }}-${{ matrix.release_arch }}
+          path: dist/keensteer-*-${{ matrix.release_arch }}.tar.gz
           if-no-files-found: error
 
   release:
     if: github.event_name == 'push'
-    needs: [check, mips]
+    needs: [check, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -9,7 +9,7 @@
 #include <linux/if.h>
 #include <netinet/in.h>
 
-#define KS_VERSION "1.0.2"
+#define KS_VERSION "1.0.3"
 
 #define KS_MAX_BSS             8
 #define KS_MAX_STA           256

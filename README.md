@@ -28,14 +28,14 @@ ssh -p 222 root@192.168.1.1
 
 Replace `192.168.1.1` with your Keenetic's address. Entware uses port 222 when KeeneticOS's SSH server component is installed; otherwise Entware uses port 22.
 
-Download and install the release:
+Download the release archive matching the Entware architecture installed on the Keenetic (`mips`, `mipsel` or `aarch64`) and install it:
 
 ```sh
 cd /opt/tmp
 wget -O keensteer.tar.gz \
-  https://github.com/mhndt/keensteer/releases/download/v1.0.2/keensteer-1.0.2-mips-3.4.tar.gz
+  https://github.com/mhndt/keensteer/releases/download/v1.0.3/keensteer-1.0.3-mips.tar.gz
 tar -xzf keensteer.tar.gz
-cd keensteer-1.0.2
+cd keensteer-1.0.3
 ./install.sh
 /opt/sbin/keensteer-setup
 ```
