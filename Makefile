@@ -1,5 +1,5 @@
 CC ?= cc
-VERSION = 1.0.5
+VERSION = 1.0.6
 PREFIX ?= /opt
 DESTDIR ?=
 SBINDIR ?= $(PREFIX)/sbin
@@ -7,6 +7,7 @@ ETCDIR ?= $(PREFIX)/etc
 INITDIR ?= $(ETCDIR)/init.d
 
 CPPFLAGS += -Iinclude
+DEFS = -DKS_VERSION=\"$(VERSION)\"
 CFLAGS ?= -O2
 CFLAGS += -std=c11 -Wall -Wextra -Wformat=2 -Wshadow -Wpointer-arith \
 	-Wcast-qual -Wstrict-prototypes -Wmissing-prototypes -Werror
@@ -24,17 +25,17 @@ all: keensteerd
 keensteerd: $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
-build/%.o: src/%.c include/keensteer.h
+build/%.o: src/%.c include/keensteer.h Makefile
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(DEFS) $(CFLAGS) -c -o $@ $<
 
-build/test/%.o: src/%.c include/keensteer.h
+build/test/%.o: src/%.c include/keensteer.h Makefile
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DKS_TEST -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(DEFS) $(CFLAGS) -DKS_TEST -c -o $@ $<
 
-build/test/test.o: tests/test.c include/keensteer.h
+build/test/test.o: tests/test.c include/keensteer.h Makefile
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DKS_TEST -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(DEFS) $(CFLAGS) -DKS_TEST -c -o $@ $<
 
 build/test/test: $(TEST_OBJ)
 	$(CC) $(LDFLAGS) -Wl,--wrap=ioctl -o $@ $(TEST_OBJ) $(LDLIBS)
@@ -45,7 +46,7 @@ test: build/test/test
 
 sanitize:
 	@mkdir -p build
-	$(CC) $(CPPFLAGS) -DKS_TEST -std=c11 -O1 -g \
+	$(CC) $(CPPFLAGS) $(DEFS) -DKS_TEST -std=c11 -O1 -g \
 		-Wall -Wextra -Wformat=2 -Wshadow -Wpointer-arith -Wcast-qual \
 		-Wstrict-prototypes -Wmissing-prototypes -Werror \
 		-fsanitize=address,undefined -fno-omit-frame-pointer \
@@ -58,9 +59,10 @@ install: keensteerd
 	cp files/keensteer.conf $(DESTDIR)$(ETCDIR)/keensteer.conf.example
 	cp files/S99keensteer $(DESTDIR)$(INITDIR)/S99keensteer
 	cp files/keensteer-setup $(DESTDIR)$(SBINDIR)/keensteer-setup
+	cp files/keensteer-openwrt.sh $(DESTDIR)$(ETCDIR)/keensteer-openwrt.sh
 	chmod 0755 $(DESTDIR)$(SBINDIR)/keensteerd $(DESTDIR)$(SBINDIR)/keensteer-setup \
 		$(DESTDIR)$(INITDIR)/S99keensteer
-	chmod 0644 $(DESTDIR)$(ETCDIR)/keensteer.conf.example
+	chmod 0644 $(DESTDIR)$(ETCDIR)/keensteer.conf.example $(DESTDIR)$(ETCDIR)/keensteer-openwrt.sh
 
 clean:
 	rm -rf build keensteerd

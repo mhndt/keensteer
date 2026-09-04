@@ -498,7 +498,7 @@ static int test_config(void)
 		mock_load_len = 8; mock_load_error = false; mock_load_calls = 0;
 		s.ioctl_fd = 1; s.next_load_ms = 0; mock_wext = true;
 		ks_backend_update_load(&s);
-		CHECK(b->load == 37 && mock_load_calls == 1);
+		CHECK(b->load == 37 && mock_load_calls == 1 && b->op_class == 115);
 		ks_backend_update_load(&s); CHECK(mock_load_calls == 1);
 		s.next_load_ms = 0; mock_load[2] = 36; ks_backend_update_load(&s);
 		CHECK(!b->load);
@@ -514,7 +514,30 @@ static int test_config(void)
 		ks_backend_update_load(&s);
 		CHECK(b->load == 12 && b->channel == 36 && b->freq == 5180 && b->active);
 		s.next_load_ms = 0; mock_load[2] = 40; ks_backend_update_load(&s);
-		CHECK(!b->load && b->channel == 36);
+		CHECK(!b->load && b->channel == 36 && b->op_class == 128);
+		s.next_load_ms = 0; mock_load[2] = 36; mock_load[1] = 1; mock_load[3] = 40;
+		ks_backend_update_load(&s); CHECK(b->load == 12 && b->op_class == 116);
+		s.next_load_ms = 0; mock_load[3] = 32; ks_backend_update_load(&s);
+		CHECK(b->op_class == 117);
+		s.next_load_ms = 0; mock_load[3] = 0; ks_backend_update_load(&s);
+		CHECK(b->op_class == 116);
+		s.next_load_ms = 0; mock_load[1] = 3; ks_backend_update_load(&s);
+		CHECK(b->op_class == 129);
+		s.next_load_ms = 0; mock_load[1] = 4; ks_backend_update_load(&s);
+		CHECK(b->load == 12 && b->op_class == 129);
+		s.next_load_ms = 0; mock_load[1] = 0; ks_backend_update_load(&s);
+		CHECK(b->op_class == 115);
+		CHECK(ks_opclass(6, 40, 10) == 83 && ks_opclass(6, 40, 2) == 84 &&
+		      ks_opclass(6, 40, 0) == 83 && ks_opclass(11, 40, 0) == 84);
+		CHECK(ks_opclass(1, 20, 0) == 81 && ks_opclass(14, 20, 0) == 82 &&
+		      ks_opclass(14, 40, 0) == 82 && ks_opclass(165, 40, 0) == 125);
+		CHECK(ks_opclass(100, 80, 0) == 128 && ks_opclass(149, 160, 0) == 129 &&
+		      ks_opclass(6, 80, 0) == 81 && !ks_opclass(0, 20, 0) && !ks_opclass(200, 20, 0));
+		CHECK(ks_opclass(153, 40, 0) == 127 && ks_opclass(157, 40, 0) == 126 &&
+		      ks_opclass(64, 40, 0) == 120 && ks_opclass(140, 40, 0) == 122 &&
+		      ks_opclass(144, 40, 0) == 123 && ks_opclass(100, 40, 0) == 122);
+		CHECK(ks_opclass_width(129) == 160 && ks_opclass_width(128) == 80 &&
+		      ks_opclass_width(122) == 40 && ks_opclass_width(81) == 20);
 		mock_freq_channel = 44;
 		mock_wext = false;
 	}

@@ -7,7 +7,8 @@ root=${destdir}/opt
 tmp_binary=$root/sbin/.keensteerd.$$
 tmp_init=$root/etc/init.d/.S99keensteer.$$
 tmp_setup=$root/sbin/.keensteer-setup.$$
-tmp_hdr=$root/sbin/.keensteer-hdr.$$
+tmp_openwrt=$root/etc/.keensteer-openwrt.sh.$$
+tmp_hdr=$root/etc/.keensteer-hdr.$$
 
 if [ -z "$destdir" ] && [ "$(id -u)" -ne 0 ]; then
 	echo "install.sh must run as root" >&2
@@ -67,7 +68,7 @@ if ! ./keensteerd -V >/dev/null 2>&1; then
 	exit 1
 fi
 
-trap 'rm -f "$tmp_binary" "$tmp_init" "$tmp_setup"' EXIT
+trap 'rm -f "$tmp_binary" "$tmp_init" "$tmp_setup" "$tmp_openwrt"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -82,6 +83,9 @@ mv -f "$tmp_init" "$root/etc/init.d/S99keensteer"
 cp files/keensteer-setup "$tmp_setup"
 chmod 0755 "$tmp_setup"
 mv -f "$tmp_setup" "$root/sbin/keensteer-setup"
+cp files/keensteer-openwrt.sh "$tmp_openwrt"
+chmod 0644 "$tmp_openwrt"
+mv -f "$tmp_openwrt" "$root/etc/keensteer-openwrt.sh"
 if [ ! -e "$root/etc/keensteer.conf" ]; then
 	cp files/keensteer.conf "$root/etc/keensteer.conf"
 	chmod 0600 "$root/etc/keensteer.conf"

@@ -16,16 +16,17 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - name: Check version
         run: |
-          header_version=$(sed -n 's/^#define KS_VERSION "\([^"]*\)"/\1/p' include/keensteer.h)
-          make_version=$(sed -n 's/^VERSION[[:space:]]*=[[:space:]]*//p' Makefile)
-          test "$header_version" = "$make_version"
+          version=$(sed -n 's/^VERSION[[:space:]]*=[[:space:]]*//p' Makefile)
+          test -n "$version"
+          grep -q "releases/download/v$version/keensteer-$version-mips.tar.gz" README.md
+          grep -q "^cd keensteer-$version\$" README.md
           if [ "$GITHUB_EVENT_NAME" = "push" ]; then
-            test "v$header_version" = "$GITHUB_REF_NAME"
+            test "v$version" = "$GITHUB_REF_NAME"
           fi
       - run: make test
       - name: Check shell scripts
         run: |
-          for script in install.sh uninstall.sh files/S99keensteer files/keensteer-setup tests/test-setup.sh; do
+          for script in install.sh uninstall.sh files/S99keensteer files/keensteer-setup files/keensteer-openwrt.sh tests/test-setup.sh; do
             dash -n "$script"
           done
 
@@ -37,22 +38,25 @@ jobs:
       matrix:
         include:
           - arch: mips-3.4
+            digest: sha256:eaab8e9c40e46e36e19477ffa92930ef29abbcb993bf4a1b8f08a8d806725e5a
             release_arch: mips
             machine: MIPS
             data: big endian
             loader: /opt/lib/ld.so.1
           - arch: mipsel-3.4
+            digest: sha256:c044f146a8ef8f2af177cb57c30920bf88f66661b3655acba10959427b6ed745
             release_arch: mipsel
             machine: MIPS
             data: little endian
             loader: /opt/lib/ld.so.1
           - arch: aarch64-3.10
+            digest: sha256:00c0ec69b1dff0c6f98ff1ec90dde31a64396b8737039e53da8baf26900f5095
             release_arch: aarch64
             machine: AArch64
             data: little endian
             loader: /opt/lib/ld-linux-aarch64.so.1
     container:
-      image: waujito/entware_builder:${{ matrix.arch }}
+      image: waujito/entware_builder@${{ matrix.digest }}
       options: --user root
     steps:
       - uses: actions/checkout@v4

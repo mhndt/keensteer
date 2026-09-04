@@ -21,6 +21,6 @@ if [ -z "$destdir" ] && [ -x "$root/etc/init.d/S99keensteer" ]; then
 	"$root/etc/init.d/S99keensteer" stop >/dev/null 2>&1 || true
 fi
 rm -f "$root/sbin/keensteerd" "$root/sbin/keensteer-setup" \
-	"$root/etc/init.d/S99keensteer"
+	"$root/etc/init.d/S99keensteer" "$root/etc/keensteer-openwrt.sh"
 echo "Removed keensteer and its init script."
 echo "Configuration and keys were preserved."

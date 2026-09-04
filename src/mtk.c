@@ -192,6 +192,15 @@ void ks_backend_update_load(struct ks_state *s)
 			if (rediscovered || ks_topology_discover(s)) continue;
 			rediscovered = true; i = (size_t) -1; continue;
 		}
+		if (response[1] <= 3) {
+			int op_class = ks_opclass(b->channel, 20 << response[1], response[3]);
+
+			if (op_class && op_class != b->op_class) {
+				ks_log(KS_LOG_INFO, "%s: operating class %d -> %d (%d MHz)",
+				       b->ifname, b->op_class, op_class, 20 << response[1]);
+				b->op_class = op_class;
+			}
+		}
 		b->load = response[6];
 	}
 }

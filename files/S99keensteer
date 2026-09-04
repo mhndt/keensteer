@@ -2,50 +2,106 @@
 
 ENABLED=yes
 DESC="keensteer"
+PROC=keensteerd
+ACTION=${1:-}
 root=${KEENSTEER_ROOT:-}
 PATH=$root/opt/sbin:/opt/sbin:/opt/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
+ansi_red="\033[1;31m"
+ansi_white="\033[1;37m"
+ansi_green="\033[1;32m"
+ansi_yellow="\033[1;33m"
+ansi_std="\033[m"
+
 configs()
 {
-	ls "$root/opt/etc/keensteer.conf" "$root"/opt/etc/keensteer-*.conf 2>/dev/null
+	ls "$root/opt/etc/keensteer.conf" 2>/dev/null
+	ls "$root"/opt/etc/keensteer-*.conf 2>/dev/null
 }
 
 running()
 {
-	for pid in $(pidof keensteerd); do
+	for pid in $(pidof $PROC); do
 		tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -Fq -- " -c $1 " && return 0
 	done
 	return 1
 }
 
+alive()
+{
+	[ -n "$(pidof $PROC)" ]
+}
+
 start()
 {
 	[ "$ENABLED" = yes ] || return 8
-	for c in $(configs); do
-		running "$c" && continue
-		keensteerd -c "$c" >/dev/null 2>&1 &
+	printf "$ansi_white Starting $DESC... $ansi_std"
+	list=$(configs)
+	missing=
+	for c in $list; do
+		running "$c" || missing="$missing $c"
+	done
+	if [ -n "$list" ] && [ -z "$missing" ]; then
+		printf "            $ansi_yellow already running. $ansi_std\n"
+		return 0
+	fi
+	for c in $missing; do
+		$PROC -c "$c" >/dev/null 2>&1 &
 	done
 	sleep 1
-	for c in $(configs); do
-		running "$c" || { echo "$DESC: failed to start $c" >&2; return 255; }
+	for c in $missing; do
+		running "$c" || list=
 	done
-	echo "$DESC: started"
+	if [ -z "$list" ]; then
+		printf "            $ansi_red failed. $ansi_std\n"
+		return 255
+	fi
+	printf "            $ansi_green done. $ansi_std\n"
 }
 
 stop()
 {
-	killall keensteerd 2>/dev/null
-	n=0
-	while [ -n "$(pidof keensteerd)" ] && [ "$n" -lt 10 ]; do sleep 1; n=$((n + 1)); done
-	[ -z "$(pidof keensteerd)" ] || { echo "$DESC: failed to stop" >&2; return 255; }
-	echo "$DESC: stopped"
+	case $ACTION in
+		stop|restart)
+			printf "$ansi_white Shutting down $PROC... $ansi_std"
+			killall $PROC 2>/dev/null
+			n=0
+			while alive && [ "$n" -lt 10 ]; do sleep 1; n=$((n + 1)); done
+			;;
+		kill)
+			printf "$ansi_white Killing $PROC... $ansi_std"
+			killall -9 $PROC 2>/dev/null
+			;;
+	esac
+	if alive; then
+		printf "            $ansi_red failed. $ansi_std\n"
+		return 255
+	fi
+	printf "            $ansi_green done. $ansi_std\n"
 }
 
-case "${1:-}" in
+check()
+{
+	rc=0
+	list=$(configs)
+	[ -n "$list" ] || list=$root/opt/etc/keensteer.conf
+	for c in $list; do
+		name=${c##*/}
+		printf "$ansi_white Checking ${name%.conf}... "
+		if running "$c"; then
+			printf "            $ansi_green alive. $ansi_std\n"
+		else
+			printf "            $ansi_red dead. $ansi_std\n"
+			rc=1
+		fi
+	done
+	return $rc
+}
+
+case $ACTION in
 	start) start ;;
-	stop) stop ;;
-	restart) stop && start ;;
-	kill) killall -9 keensteerd 2>/dev/null ;;
-	check) for c in $(configs); do running "$c" && echo "$c: alive" || echo "$c: dead"; done ;;
-	*) echo "usage: $0 {start|stop|restart|check|kill}" >&2; exit 1 ;;
+	stop|kill) check; alive && stop ;;
+	restart) { ! alive || stop; } && start ;;
+	check) check ;;
+	*) printf "$ansi_white Usage: $0 (start|stop|restart|check|kill)$ansi_std\n"; exit 1 ;;
 esac

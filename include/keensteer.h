@@ -9,8 +9,6 @@
 #include <linux/if.h>
 #include <netinet/in.h>
 
-#define KS_VERSION "1.0.5"
-
 #define KS_MAX_BSS             8
 #define KS_MAX_STA           256
 #define KS_MAX_USTEER_PEERS   16
@@ -236,6 +234,8 @@ int ks_load_rrb_key(const char *path, uint8_t key[32], char *err,
 		    size_t err_len);
 
 int ks_topology_discover(struct ks_state *s);
+int ks_opclass(int channel, int width, int secondary);
+int ks_opclass_width(int op_class);
 struct ks_station *ks_station_get(struct ks_state *s, const uint8_t addr[6],
 				  bool create);
 void ks_station_expire(struct ks_state *s, uint64_t now);

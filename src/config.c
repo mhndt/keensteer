@@ -332,39 +332,49 @@ static int channel_from_freq(int mhz)
 	return 0;
 }
 
+int ks_opclass_width(int op_class)
+{
+	switch (op_class) {
+	case 129: return 160;
+	case 128: return 80;
+	case 83: case 84: case 116: case 117: case 119: case 120:
+	case 122: case 123: case 126: case 127: return 40;
+	default: return 20;
+	}
+}
+
+int ks_opclass(int channel, int width, int secondary)
+{
+	bool above;
+
+	if (channel < 1) return 0;
+	if (width == 160 && channel >= 36 && channel <= 177) return 129;
+	if (width == 80 && channel >= 36 && channel <= 177) return 128;
+	if (width == 40) {
+		if (secondary) above = secondary > channel;
+		else if (channel <= 13) above = channel <= 9;
+		else above = ((channel - 36) / 4) % 2 == 0;
+		if (channel <= 13) return above ? 83 : 84;
+		if (channel >= 36 && channel <= 48) return above ? 116 : 117;
+		if (channel >= 52 && channel <= 64) return above ? 119 : 120;
+		if (channel >= 100 && channel <= 144) return above ? 122 : 123;
+		if (channel >= 149 && channel <= 161) return above ? 126 : 127;
+	}
+	if (channel == 14) return 82;
+	if (channel <= 13) return 81;
+	if (channel >= 36 && channel <= 48) return 115;
+	if (channel >= 52 && channel <= 64) return 118;
+	if (channel >= 100 && channel <= 144) return 121;
+	if (channel >= 149 && channel <= 161) return 124;
+	if (channel == 165) return 125;
+	return 0;
+}
+
 static int opclass_from_channel(int channel, int current)
 {
-	switch (current) {
-	case 128:
-	case 129:
-		return current;
-	case 83: case 84: case 116: case 117: case 119: case 120:
-	case 122: case 123: case 126: case 127:
-		if (channel >= 1 && channel <= 9) return 83;
-		if (channel >= 10 && channel <= 13) return 84;
-		if (channel == 36 || channel == 44) return 116;
-		if (channel == 40 || channel == 48) return 117;
-		if (channel == 52 || channel == 60) return 119;
-		if (channel == 56 || channel == 64) return 120;
-		if (channel == 100 || channel == 108 || channel == 116 ||
-		    channel == 124 || channel == 132 || channel == 140) return 122;
-		if (channel == 104 || channel == 112 || channel == 120 ||
-		    channel == 128 || channel == 136 || channel == 144) return 123;
-		if (channel == 149 || channel == 157) return 126;
-		if (channel == 153 || channel == 161) return 127;
-		return current;
-	case 81: case 82: case 115: case 118: case 121: case 124: case 125:
-		if (channel == 14) return 82;
-		if (channel >= 1 && channel <= 13) return 81;
-		if (channel >= 36 && channel <= 48) return 115;
-		if (channel >= 52 && channel <= 64) return 118;
-		if (channel >= 100 && channel <= 144) return 121;
-		if (channel >= 149 && channel <= 161) return 124;
-		if (channel == 165) return 125;
-		return current;
-	default:
-		return current;
-	}
+	int op_class = ks_opclass(channel, ks_opclass_width(current), 0);
+
+	return op_class ? op_class : current;
 }
 
 static int discover_one(int fd, struct ks_bss *b)
