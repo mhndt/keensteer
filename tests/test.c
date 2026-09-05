@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/rtnetlink.h>
 #include <linux/wireless.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -11,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -540,6 +542,47 @@ static int test_config(void)
 		      ks_opclass_width(122) == 40 && ks_opclass_width(81) == 20);
 		mock_freq_channel = 44;
 		mock_wext = false;
+	}
+	{
+		struct ks_state s;
+		struct ks_bss *b;
+		struct { struct nlmsghdr nh; struct ifinfomsg ifi; } msg;
+		int sv[2];
+
+		memset(&s, 0, sizeof(s)); ks_config_defaults(&s.cfg);
+		strcpy(s.cfg.transport_if, "lo"); s.cfg.n_bss = 1; b = &s.cfg.bss[0];
+		strcpy(b->ifname, "lo"); strcpy(b->name, "node"); strcpy(b->ssid, "ess");
+		memcpy(b->bssid, (uint8_t[]) { 0x02, 0, 0, 0, 0, 1 }, 6);
+		memcpy(b->r1kh_id, b->bssid, 6); b->channel = 36; b->freq = 5180;
+		b->op_class = 128; b->band = KS_BAND_5GHZ;
+		s.transport_ifindex = 1; s.ioctl_fd = 1;
+		CHECK(!socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+		s.netlink_fd = sv[0];
+		memset(&msg, 0, sizeof(msg));
+		msg.nh.nlmsg_len = NLMSG_LENGTH(sizeof(msg.ifi));
+		msg.nh.nlmsg_type = RTM_NEWLINK;
+		msg.ifi.ifi_index = 99;
+		CHECK(!ks_active_bss(&s));
+		mock_wext = true;
+		CHECK(send(sv[1], &msg, sizeof(msg), 0) == (ssize_t) sizeof(msg));
+		CHECK(ks_backend_handle_netlink(&s) == 1 && b->active && b->channel == 44 &&
+		      ks_active_bss(&s) == 1);
+		mock_freq_channel = 48;
+		CHECK(send(sv[1], &msg, sizeof(msg), 0) == (ssize_t) sizeof(msg));
+		CHECK(ks_backend_handle_netlink(&s) == 1 && b->active && b->channel == 44);
+		msg.ifi.ifi_index = 1;
+		CHECK(send(sv[1], &msg, sizeof(msg), 0) == (ssize_t) sizeof(msg));
+		CHECK(ks_backend_handle_netlink(&s) == 1 && b->active && b->channel == 48);
+		s.cfg.n_bss = 2; s.cfg.bss[1] = *b; strcpy(s.cfg.bss[1].name, "node2");
+		s.cfg.bss[1].active = false; mock_freq_channel = 52; msg.ifi.ifi_index = 99;
+		CHECK(send(sv[1], &msg, sizeof(msg), 0) == (ssize_t) sizeof(msg));
+		CHECK(ks_backend_handle_netlink(&s) == 1 && ks_active_bss(&s) == 2 && b->channel == 52);
+		mock_freq_channel = 56;
+		CHECK(send(sv[1], &msg, sizeof(msg), 0) == (ssize_t) sizeof(msg));
+		CHECK(ks_backend_handle_netlink(&s) == 1 && b->channel == 52);
+		mock_freq_channel = 44;
+		mock_wext = false;
+		close(sv[0]); close(sv[1]);
 	}
 	return 0;
 }

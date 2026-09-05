@@ -1,5 +1,5 @@
 CC ?= cc
-VERSION = 1.0.6
+VERSION = 1.0.7
 PREFIX ?= /opt
 DESTDIR ?=
 SBINDIR ?= $(PREFIX)/sbin

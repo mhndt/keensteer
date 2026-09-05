@@ -767,7 +767,8 @@ int ks_backend_handle_netlink(struct ks_state *s)
 			wireless = true;
 			wireless_events(s, ifi->ifi_index, RTA_DATA(rta), RTA_PAYLOAD(rta));
 		}
-		if (!wireless && (bss >= 0 || ifi->ifi_index == s->transport_ifindex))
+		if (!wireless && (bss >= 0 || ifi->ifi_index == s->transport_ifindex ||
+				  ks_active_bss(s) < s->cfg.n_bss))
 			(void) ks_topology_discover(s);
 	}
 	return 1;

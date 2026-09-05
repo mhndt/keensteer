@@ -234,6 +234,7 @@ int ks_load_rrb_key(const char *path, uint8_t key[32], char *err,
 		    size_t err_len);
 
 int ks_topology_discover(struct ks_state *s);
+size_t ks_active_bss(const struct ks_state *s);
 int ks_opclass(int channel, int width, int secondary);
 int ks_opclass_width(int op_class);
 struct ks_station *ks_station_get(struct ks_state *s, const uint8_t addr[6],

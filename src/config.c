@@ -443,11 +443,20 @@ static int discover_one(int fd, struct ks_bss *b)
 	return b->active ? 0 : -1;
 }
 
+size_t ks_active_bss(const struct ks_state *s)
+{
+	size_t i, n = 0;
+
+	for (i = 0; i < s->cfg.n_bss; i++)
+		if (s->cfg.bss[i].active) n++;
+	return n;
+}
+
 int ks_topology_discover(struct ks_state *s)
 {
 	struct ifreq ifr;
 	int fd, active = 0;
-	size_t i;
+	size_t i, before = ks_active_bss(s);
 
 	fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 	if (fd < 0) return -1;
@@ -467,6 +476,8 @@ int ks_topology_discover(struct ks_state *s)
 	for (i = 0; i < s->cfg.n_bss; i++)
 		if (!discover_one(fd, &s->cfg.bss[i])) active++;
 	close(fd);
+	if ((size_t) active != before)
+		ks_log(KS_LOG_INFO, "%d active access point%s", active, active == 1 ? "" : "s");
 	return active ? 0 : -1;
 }
 

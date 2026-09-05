@@ -195,9 +195,11 @@ static int drain(struct ks_state *s, int (*fn)(struct ks_state *))
 	return rc;
 }
 
+#define DISCOVER_RETRY_MS 60000
+
 static int run(struct ks_state *s)
 {
-	uint64_t next_expire = ks_now_ms();
+	uint64_t next_expire = ks_now_ms(), next_discover = next_expire + DISCOVER_RETRY_MS;
 
 	while (!stopped) {
 		struct pollfd pfd[3];
@@ -214,6 +216,10 @@ static int run(struct ks_state *s)
 			ks_backend_reprobe(s, now);
 			(void) ks_backend_reconcile(s, now);
 			next_expire = now + 1000;
+		}
+		if (now >= next_discover) {
+			if (ks_active_bss(s) < s->cfg.n_bss) (void) ks_topology_discover(s);
+			next_discover = now + DISCOVER_RETRY_MS;
 		}
 		if (s->cfg.usteer_enabled && now >= s->next_usteer_ms) {
 			if (ks_usteer_send(s))
@@ -284,10 +290,12 @@ int main(int argc, char **argv)
 		ks_log(KS_LOG_ERROR, "no subsystem enabled");
 		goto out;
 	}
-	if (ks_topology_discover(&s)) {
-		ks_log(KS_LOG_ERROR, "no usable local BSS");
+	if (ks_topology_discover(&s) && !s.transport_ifindex) {
+		ks_log(KS_LOG_ERROR, "interface %s not found", s.cfg.transport_if);
 		goto out;
 	}
+	if (!ks_active_bss(&s))
+		ks_log(KS_LOG_WARN, "no active access point yet, waiting");
 	if (s.cfg.ft_enabled &&
 	    ks_load_rrb_key(s.cfg.rrb_key_file, s.rrb_key, err, sizeof(err))) {
 		ks_log(KS_LOG_WARN, "FT disabled: %s", err);
