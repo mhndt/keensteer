@@ -1,5 +1,7 @@
 # keensteer
 
+[![Release](https://img.shields.io/github/v/release/mhndt/keensteer)](https://github.com/mhndt/keensteer/releases) [![CI](https://github.com/mhndt/keensteer/actions/workflows/ci.yml/badge.svg)](https://github.com/mhndt/keensteer/actions/workflows/ci.yml)
+
 keensteer enables seamless roaming between Keenetic and OpenWrt access points.
 
 It runs on the Keenetic as a small translation layer between Keenetic's roaming stack and usteer / usteer-ng on OpenWrt. It reports connected clients to usteer and handles the 802.11r key exchange needed for fast roaming between both sides.
