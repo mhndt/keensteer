@@ -37,6 +37,10 @@ start()
 	[ "$ENABLED" = yes ] || return 8
 	printf "$ansi_white Starting $DESC... $ansi_std"
 	list=$(configs)
+	if [ -z "$list" ]; then
+		printf "            $ansi_yellow not configured. $ansi_std\n"
+		return 0
+	fi
 	missing=
 	for c in $list; do
 		running "$c" || missing="$missing $c"
@@ -84,7 +88,10 @@ check()
 {
 	rc=0
 	list=$(configs)
-	[ -n "$list" ] || list=$root/opt/etc/keensteer.conf
+	if [ -z "$list" ]; then
+		printf "$ansi_white Checking $DESC... $ansi_yellow not configured. $ansi_std\n"
+		return 0
+	fi
 	for c in $list; do
 		name=${c##*/}
 		printf "$ansi_white Checking ${name%.conf}... "

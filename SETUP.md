@@ -357,4 +357,19 @@ Clients move from OpenWrt to a Keenetic when usteer steers them or when they dec
 
 # Other segments
 
-The helper configures the Home segment by default. Another segment is configured with its bridge name, for example `keensteer-setup -s br1` for the first additional segment (Bridge1, usually the guest network). The bridge number is the one in the segment's `id` shown by `ndmc -c 'show interface'` (`Bridge1` is `br1`, and `-s Bridge1` is accepted too). The helper takes the access points that are ports of that bridge, matches them to their `WifiMasterX/AccessPointY` entries and configures the OpenWrt interfaces carrying that segment's SSID like the Home ones, including adding their network to usteer. The configuration is written to `/opt/etc/keensteer-<bridge>.conf` and the init script starts one daemon per configuration file. On OpenWrt the segment has to reach the bridge its matching SSID is attached to, which means carrying it over the link as a VLAN; the helper does not set that up.
+The helper configures the Home segment by default. To configure another segment, pass its bridge name with `-s`:
+
+```sh
+keensteer-setup -s br1
+```
+
+`Bridge1` is `br1`, and `-s Bridge1` is accepted too. On a fresh install, this configures only Bridge1. The matching segment must already be available on the OpenWrt AP, typically over a VLAN.
+
+Remove a segment from keensteer with `-d`:
+
+```sh
+keensteer-setup -d
+keensteer-setup -d -s br1
+```
+
+The first command removes Home and the second removes Bridge1. The remaining daemon instances are restarted. `-d` does not change 802.11r/k/v or R0KH/R1KH settings.

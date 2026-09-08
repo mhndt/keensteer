@@ -26,6 +26,7 @@ make_root()
 	printf '%s\n' 02:11:22:33:45:50 > "$root/sys/class/net/ra8/address"
 	printf 'br0\n5\nra0\nra8\n' > "$root/var/run/bndstrg-br0.conf"
 	cp files/keensteer-openwrt.sh "$root/opt/etc/keensteer-openwrt.sh"
+	cp files/keensteer.conf "$root/opt/etc/keensteer.conf.example"
 
 	cat > "$root/bin/ndmc" <<'EOF'
 #!/bin/sh
@@ -87,6 +88,47 @@ run_setup()
 {
 	KEENSTEER_ROOT=$root KEENSTEER_NDMC=$root/bin/ndmc KEENSTEER_SSH=$root/bin/ssh \
 		./files/keensteer-setup "$@"
+}
+
+fresh_install()
+{
+	make_root
+	mkdir -p "$root/opt/etc/init.d"
+	rm -f "$root/opt/etc/keensteer.conf.example"
+	DESTDIR=$root ./install.sh >/dev/null
+	[ ! -e "$config" ]
+	cmp -s files/keensteer.conf "$root/opt/etc/keensteer.conf.example"
+
+	cp files/keensteer.conf "$config"
+	printf 'guest\n' > "$guest"
+	DESTDIR=$root ./install.sh >/dev/null
+	[ ! -e "$config" ] && [ -e "$guest" ]
+
+	printf 'custom\n' > "$config"
+	DESTDIR=$root ./install.sh >/dev/null
+	grep -qx custom "$config"
+	grep -qx guest "$guest"
+}
+
+delete_segments()
+{
+	make_root
+	mkdir -p "$root/opt/etc/init.d"
+	printf '#!/bin/sh\necho "$1" >> "%s"\n' "$root/tmp/init.log" > "$root/opt/etc/init.d/S99keensteer"
+	chmod 0755 "$root/opt/etc/init.d/S99keensteer"
+	printf 'home\n' > "$config"
+	printf 'guest\n' > "$guest"
+
+	run_setup -d -s Bridge1 >/dev/null
+	[ -e "$config" ] && [ ! -e "$guest" ]
+	[ ! -e "$guest.bak" ]
+	grep -qx restart "$root/tmp/init.log"
+
+	: > "$root/tmp/init.log"
+	run_setup -d >/dev/null
+	[ ! -e "$config" ]
+	[ ! -e "$config.bak" ]
+	grep -qx restart "$root/tmp/init.log"
 }
 
 reject_unmatched_host()
@@ -218,10 +260,54 @@ guest_segment()
 	dash -n "$openwrt"
 }
 
+guest_only()
+{
+	make_root
+	for ifname in br1 ra1 rai1; do mkdir -p "$root/sys/class/net/$ifname"; done
+	printf '%s\n' 02:11:22:33:44:70 > "$root/sys/class/net/br1/address"
+	printf '%s\n' 02:11:22:33:44:60 > "$root/sys/class/net/ra1/address"
+	printf '%s\n' 02:11:22:33:45:60 > "$root/sys/class/net/rai1/address"
+	mkdir -p "$root/sys/class/net/br1/brif/ra1" "$root/sys/class/net/br1/brif/rai1"
+	printf '192.168.1.2\nn\nKN\ny\n' | run_setup -s br1 >/dev/null
+	[ ! -e "$config" ]
+	grep -qx 'interface=br1' "$guest"
+}
+
+init_without_config()
+{
+	make_root
+	KEENSTEER_ROOT=$root sh ./files/S99keensteer start > "$root/tmp/init.out"
+	grep -q 'not configured' "$root/tmp/init.out"
+	KEENSTEER_ROOT=$root sh ./files/S99keensteer check > "$root/tmp/init.out"
+	grep -q 'not configured' "$root/tmp/init.out"
+	KEENSTEER_ROOT=$root sh ./files/S99keensteer restart > "$root/tmp/init.out"
+	grep -q 'not configured' "$root/tmp/init.out"
+}
+
+uninstall_keeps_config()
+{
+	make_root
+	mkdir -p "$root/opt/etc/init.d"
+	DESTDIR=$root ./install.sh >/dev/null
+	printf 'custom\n' > "$config"
+	printf 'guest\n' > "$guest"
+	printf 'key\n' > "$key"
+	DESTDIR=$root ./uninstall.sh >/dev/null
+	[ ! -e "$root/opt/etc/keensteer.conf.example" ]
+	grep -qx custom "$config"
+	grep -qx guest "$guest"
+	grep -qx key "$key"
+}
+
+fresh_install
+delete_segments
+init_without_config
+uninstall_keeps_config
 reject_unmatched_host
 cleanup_on_sigterm
 guided_home_setup
 single_band_fallback
 guest_segment
+guest_only
 
 echo "ok setup"

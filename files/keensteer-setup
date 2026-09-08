@@ -8,6 +8,7 @@ key_file=$root$key_path
 sys_class_net=$root/sys/class/net
 ndmc=${KEENSTEER_NDMC:-$root/bin/ndmc}
 hosts=
+delete_mode=0
 
 cleanup()
 {
@@ -96,12 +97,15 @@ opclass()
 parse_args()
 {
 	segment=br0
-	while getopts s: opt; do
+	while getopts ds: opt; do
 		case $opt in
+			d) delete_mode=1 ;;
 			s) segment=$OPTARG ;;
-			*) echo "usage: keensteer-setup [-s bridge]" >&2; exit 2 ;;
+			*) echo "usage: keensteer-setup [-d] [-s bridge]" >&2; exit 2 ;;
 		esac
 	done
+	shift $((OPTIND - 1))
+	[ "$#" -eq 0 ] || { echo "usage: keensteer-setup [-d] [-s bridge]" >&2; exit 2; }
 	case $segment in Bridge[0-9]|Bridge[0-9][0-9]) segment=br${segment#Bridge} ;; esac
 	case $segment in br[0-9]|br[0-9][0-9]) ;; *) die "segment must be a bridge such as br1" ;; esac
 	if [ "$segment" = br0 ]; then
@@ -110,6 +114,20 @@ parse_args()
 		config=$root/opt/etc/keensteer-$segment.conf
 	fi
 	bndstrg=$root/var/run/bndstrg-$segment.conf
+}
+
+delete_config()
+{
+	[ -n "$root" ] || [ "$(id -u)" -eq 0 ] || die "must run as root"
+	[ -e "$config" ] || die "configuration not found: $config"
+	rm -f "$config"
+	echo "Removed $config"
+
+	init=$root/opt/etc/init.d/S99keensteer
+	if [ -x "$init" ]; then
+		"$init" restart ||
+			echo "keensteer did not restart, check: ndmc -c 'show log' | grep -i keensteer"
+	fi
 }
 
 read_segment()
@@ -472,6 +490,10 @@ restart_daemon()
 }
 
 parse_args "$@"
+if [ "$delete_mode" -eq 1 ]; then
+	delete_config
+	exit 0
+fi
 read_segment
 list_keenetic_aps
 write_probe_script

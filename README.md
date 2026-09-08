@@ -35,9 +35,9 @@ Download the release archive matching the Entware architecture installed on the 
 ```sh
 cd /opt/tmp
 wget -O keensteer.tar.gz \
-  https://github.com/mhndt/keensteer/releases/download/v1.0.7/keensteer-1.0.7-mips.tar.gz
+  https://github.com/mhndt/keensteer/releases/download/v1.0.8/keensteer-1.0.8-mips.tar.gz
 tar -xzf keensteer.tar.gz
-cd keensteer-1.0.7
+cd keensteer-1.0.8
 ./install.sh
 /opt/sbin/keensteer-setup
 ```

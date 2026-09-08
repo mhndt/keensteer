@@ -8,6 +8,7 @@ tmp_binary=$root/sbin/.keensteerd.$$
 tmp_init=$root/etc/init.d/.S99keensteer.$$
 tmp_setup=$root/sbin/.keensteer-setup.$$
 tmp_openwrt=$root/etc/.keensteer-openwrt.sh.$$
+tmp_example=$root/etc/.keensteer.conf.example.$$
 tmp_hdr=$root/etc/.keensteer-hdr.$$
 
 if [ -z "$destdir" ] && [ "$(id -u)" -ne 0 ]; then
@@ -25,9 +26,20 @@ fi
 
 had_config=0
 was_running=0
-if [ -e "$root/etc/keensteer.conf" ]; then
-	had_config=1
+stock_home=0
+if [ -e "$root/etc/keensteer.conf" ] &&
+   cmp -s "$root/etc/keensteer.conf" files/keensteer.conf; then
+	stock_home=1
 fi
+for c in "$root/etc/keensteer.conf" "$root"/etc/keensteer-*.conf; do
+	if [ "$stock_home" -eq 1 ] && [ "$c" = "$root/etc/keensteer.conf" ]; then
+		continue
+	fi
+	if [ -e "$c" ]; then
+		had_config=1
+		break
+	fi
+done
 if [ -z "$destdir" ] && pidof keensteerd >/dev/null 2>&1; then
 	was_running=1
 fi
@@ -68,7 +80,7 @@ if ! ./keensteerd -V >/dev/null 2>&1; then
 	exit 1
 fi
 
-trap 'rm -f "$tmp_binary" "$tmp_init" "$tmp_setup" "$tmp_openwrt"' EXIT
+trap 'rm -f "$tmp_binary" "$tmp_init" "$tmp_setup" "$tmp_openwrt" "$tmp_example"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -86,10 +98,10 @@ mv -f "$tmp_setup" "$root/sbin/keensteer-setup"
 cp files/keensteer-openwrt.sh "$tmp_openwrt"
 chmod 0644 "$tmp_openwrt"
 mv -f "$tmp_openwrt" "$root/etc/keensteer-openwrt.sh"
-if [ ! -e "$root/etc/keensteer.conf" ]; then
-	cp files/keensteer.conf "$root/etc/keensteer.conf"
-	chmod 0600 "$root/etc/keensteer.conf"
-fi
+cp files/keensteer.conf "$tmp_example"
+chmod 0644 "$tmp_example"
+mv -f "$tmp_example" "$root/etc/keensteer.conf.example"
+[ "$stock_home" -eq 0 ] || rm -f "$root/etc/keensteer.conf"
 trap - EXIT
 
 echo "Installed $root/sbin/keensteerd"
@@ -101,8 +113,9 @@ if [ "$had_config" -eq 1 ]; then
 		echo "Start with: $root/etc/init.d/S99keensteer start"
 	fi
 else
-	echo "Created $root/etc/keensteer.conf"
+	echo "Installed $root/etc/keensteer.conf.example"
 	if [ -z "$destdir" ]; then
+		[ "$was_running" -eq 0 ] || "$root/etc/init.d/S99keensteer" stop >/dev/null 2>&1 || true
 		echo "Run $root/sbin/keensteer-setup to configure roaming."
 	fi
 fi

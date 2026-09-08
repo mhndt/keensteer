@@ -1,5 +1,5 @@
 CC ?= cc
-VERSION = 1.0.7
+VERSION = 1.0.8
 PREFIX ?= /opt
 DESTDIR ?=
 SBINDIR ?= $(PREFIX)/sbin
@@ -40,7 +40,7 @@ build/test/test.o: tests/test.c include/keensteer.h Makefile
 build/test/test: $(TEST_OBJ)
 	$(CC) $(LDFLAGS) -Wl,--wrap=ioctl -o $@ $(TEST_OBJ) $(LDLIBS)
 
-test: build/test/test
+test: keensteerd build/test/test
 	./build/test/test
 	./tests/test-setup.sh
 
