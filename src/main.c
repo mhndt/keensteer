@@ -319,6 +319,7 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	s.next_usteer_ms = ks_now_ms();
+	ks_backend_abi_check(&s);
 	ks_log(KS_LOG_INFO, "started usteer=%u ft=%u bss=%zu",
 	       s.cfg.usteer_enabled, s.cfg.ft_enabled, s.cfg.n_bss);
 	rc = run(&s) ? 1 : 0;

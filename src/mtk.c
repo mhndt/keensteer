@@ -205,6 +205,29 @@ void ks_backend_update_load(struct ks_state *s)
 	}
 }
 
+void ks_backend_abi_check(struct ks_state *s)
+{
+	size_t i, probed = 0, ok = 0;
+
+	if (s->ioctl_fd < 0) return;
+	for (i = 0; i < s->cfg.n_bss; i++) {
+		struct ks_bss *b = &s->cfg.bss[i];
+		uint8_t response[8] = {0};
+		struct iwreq wrq;
+
+		if (!b->active) continue;
+		probed++;
+		memset(&wrq, 0, sizeof(wrq));
+		memcpy(wrq.ifr_name, b->ifname, strlen(b->ifname) + 1);
+		wrq.u.data.pointer = response; wrq.u.data.length = sizeof(response);
+		if (ioctl(s->ioctl_fd, KS_MTK_LOAD_IOCTL, &wrq) == 0 &&
+		    wrq.u.data.length == sizeof(response) && response[1] <= 4 && response[6] <= 100)
+			ok++;
+	}
+	if (probed && !ok)
+		ks_log(KS_LOG_ERROR, "driver ABI check failed: load ioctl invalid on all %zu active BSS", probed);
+}
+
 void ks_backend_reprobe(struct ks_state *s, uint64_t now)
 {
 	size_t i, n;
@@ -790,6 +813,7 @@ int ks_backend_handle_netlink(struct ks_state *s)
 
 static const uint8_t ccmp[4] = { 0x00, 0x0f, 0xac, 0x04 };
 static const uint8_t ft_sae[4] = { 0x00, 0x0f, 0xac, 0x09 };
+static const uint8_t ft_psk[4] = { 0x00, 0x0f, 0xac, 0x04 };
 
 static bool all_zero(const uint8_t *p, size_t len)
 {
@@ -1059,7 +1083,8 @@ int ks_kdp_handle_response(struct ks_state *s, int ifindex, uint32_t correlation
 		if (!memcmp(e + KDP_PMKR0NAME, (uint8_t[16]) {0}, 16) ||
 		    !memcmp(e + KDP_PMKR1NAME, (uint8_t[16]) {0}, 16) ||
 		    !memcmp(e + KDP_PMK_R1, (uint8_t[32]) {0}, 32) ||
-		    memcmp(e + KDP_PAIRWISE, ccmp, 4) || memcmp(e + KDP_AKM, ft_sae, 4) ||
+		    memcmp(e + KDP_PAIRWISE, ccmp, 4) ||
+		    (memcmp(e + KDP_AKM, ft_sae, 4) && memcmp(e + KDP_AKM, ft_psk, 4)) ||
 		    !ks_get_le32(e + KDP_LIFETIME)) return pending_miss(s, p);
 		memcpy(&q, p, sizeof(q)); ks_secure_clear(p, sizeof(*p));
 		rc = q.rrb_pull ?

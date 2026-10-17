@@ -257,6 +257,7 @@ void ks_backend_close(struct ks_state *s);
 void ks_backend_reprobe(struct ks_state *s, uint64_t now);
 int ks_backend_reconcile(struct ks_state *s, uint64_t now);
 void ks_backend_update_load(struct ks_state *s);
+void ks_backend_abi_check(struct ks_state *s);
 int ks_backend_handle_packet(struct ks_state *s);
 int ks_backend_handle_netlink(struct ks_state *s);
 int ks_backend_ft_query(struct ks_state *s, int bss_index,
