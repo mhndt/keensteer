@@ -38,6 +38,13 @@ static bool mock_priv_error, mock_priv_missing;
 static struct { char ifname[IFNAMSIZ]; const char *text; bool error; } mock_table[2];
 static uint16_t mock_table_len;
 static unsigned int mock_table_calls;
+static bool mock_priv_on;
+static uint32_t mock_sta_rsn;
+static bool mock_sta_rsn_error;
+static unsigned int mock_sta_rsn_calls;
+static uint8_t mock_priv[KS_KDP_WRAPPER_LEN];
+static uint16_t mock_priv_oid, mock_priv_len;
+static char mock_priv_if[IFNAMSIZ];
 
 int __real_ioctl(int fd, unsigned long request, ...);
 int __wrap_ioctl(int fd, unsigned long request, ...);
@@ -97,6 +104,16 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
 		if (mock_load_error) { errno = EOPNOTSUPP; return -1; }
 		memcpy(wrq->u.data.pointer, mock_load, sizeof(mock_load));
 		wrq->u.data.length = mock_load_len;
+		return 0;
+	case KS_MTK_PRIV_IOCTL:
+		if (!mock_priv_on || wrq->u.data.length > sizeof(mock_priv)) { errno = EOPNOTSUPP; return -1; }
+		mock_priv_oid = wrq->u.data.flags; mock_priv_len = wrq->u.data.length;
+		strcpy(mock_priv_if, wrq->ifr_name);
+		memcpy(mock_priv, wrq->u.data.pointer, mock_priv_len);
+		if (mock_priv_oid != 0x0551) return 0;
+		mock_sta_rsn_calls++;
+		if (mock_sta_rsn_error) { errno = EOPNOTSUPP; return -1; }
+		if (mock_sta_rsn) memcpy((uint8_t *) wrq->u.data.pointer + 6, &mock_sta_rsn, 4);
 		return 0;
 	default:
 		errno = EOPNOTSUPP;
@@ -615,7 +632,7 @@ static int test_kdp(void)
 	for (i = 0; i < sizeof(n1); i++) n1[i] = (uint8_t) (i + 0x21);
 	for (i = 0; i < sizeof(key); i++) key[i] = (uint8_t) (i + 0x41);
 	CHECK(!ks_kdp_from_rrb(&e, sta, (uint8_t *) "r0-test", 7, n0, r1, n1,
-			       key, r0mac, 0x10, 120));
+			       key, r0mac, 0x10, 120, NULL));
 	CHECK(!ks_kdp_parse_element(e.raw, sizeof(e.raw), &parsed));
 	r0 = ks_kdp_r0kh_id(&parsed, &r0n);
 	CHECK(r0n == 7 && !memcmp(r0, "r0-test", 7));
@@ -693,7 +710,7 @@ static int test_kdp(void)
 	      !memcmp(wrapper + 12 + 0x57, sta, 6));
 	CHECK(!memcmp(wrapper + 12 + 0x61, (uint8_t[70]) {0}, 70));
 	CHECK(!ks_kdp_from_rrb(&response, sta, (uint8_t *) "keenetic-r0", 11,
-			       n0, r1, n1, key, r0mac, 0x10, 120));
+			       n0, r1, n1, key, r0mac, 0x10, 120, NULL));
 	CHECK(!ks_kdp_handle_response(&s, 8, corr, &response) && s.kdp_pending[0].used);
 	CHECK(!ks_kdp_handle_response(&s, 9, corr ^ 1, &response) && s.kdp_pending[0].used);
 	CHECK(!ks_kdp_handle_response(&s, 9, corr, &response) && !s.kdp_pending[0].used);
@@ -717,7 +734,9 @@ static int test_kdp(void)
 		if (s.pull_pending[i].used) break;
 	CHECK(i < KS_MAX_RRB_PENDING && s.pull_pending[i].target_bss == 1);
 	ks_mtk_test_counts(&rrb_count, &ioctl_count);
-	CHECK(rrb_count == 1 && ioctl_count == 0);
+	CHECK(rrb_count == 1 && ioctl_count == 1);
+	CHECK(!ks_mtk_test_last_ioctl(&oid, &ioctl_bss, wrapper, sizeof(wrapper), &ioctl_len));
+	CHECK(oid == KS_OID_STA_RSN && ioctl_bss == 1 && ioctl_len == 22 && !memcmp(wrapper, sta, 6));
 	ks_secure_clear(key, sizeof(key));
 	return 0;
 }
@@ -1110,7 +1129,7 @@ static int test_rrb_incoming_pull(void)
 	CHECK(rrb_count == 1 && ioctl_count == 1 && s.kdp_pending[pending].used &&
 	      !memcmp(s.kdp_pending[pending].nonce, nonce, 16));
 	CHECK(!ks_kdp_from_rrb(&response, sta, (const uint8_t *) r0, sizeof(r0) - 1,
-			       n0, r1, n1, pmk, local_bss, 0x10, 120));
+			       n0, r1, n1, pmk, local_bss, 0x10, 120, NULL));
 	CHECK(!ks_kdp_handle_response(&s, 9, corr ^ 1, &response) &&
 	      s.kdp_pending[pending].used);
 	response.raw[0x41] ^= 1;
@@ -1258,7 +1277,7 @@ static int test_rrb_incoming_pull(void)
 	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
 	ks_mtk_test_counts(NULL, &ioctl_count); CHECK(ioctl_count == 2);
 	CHECK(!ks_kdp_from_rrb(&response_b, sta, (const uint8_t *) r0, sizeof(r0) - 1,
-			       n0b, r1b, n1, pmk, local_bss, 0x10, 120));
+			       n0b, r1b, n1, pmk, local_bss, 0x10, 120, NULL));
 	CHECK(!ks_kdp_handle_response(&s, 9, corr, &response_b));
 	CHECK(!ks_mtk_test_last_rrb(frame, sizeof(frame), &flen));
 	CHECK(!ks_rrb_parse_frame(frame, flen, &msg) && !memcmp(msg.dst, remote2, 6));
@@ -1851,12 +1870,157 @@ static int test_rrb_logging(void)
 	for (i = 0; i < 32; i++) pmk[i] = (uint8_t) (0xa0 + i);
 	memset(n0, 0x31, sizeof(n0)); memset(n1, 0x32, sizeof(n1));
 	CHECK(!ks_kdp_from_rrb(&e, sta, (const uint8_t *) "x", 1, n0, fx_bss[0], n1, pmk,
-			       fx_peer, 0x10, 120));
+			       fx_peer, 0x10, 120, NULL));
 	source.s_addr = htonl(0xc0000216);
 	ks_test_log_count = 0;
 	for (i = 0; i < 1000; i++) CHECK(ks_backend_ft_insert(&s, 0, source, &e) < 0);
 	CHECK(ks_test_log_count == 1);
 	CHECK(!strcmp(ks_test_log, "FT key insert failed on ra0 for 02:a0:01:02:03:04"));
+	return 0;
+}
+
+static const uint8_t fx_ft_psk[4] = { 0x00, 0x0f, 0xac, 0x04 };
+static const uint8_t fx_ft_sae[4] = { 0x00, 0x0f, 0xac, 0x09 };
+
+static int fx_miss(struct ks_state *s, unsigned int bss, const uint8_t sta[6], const uint8_t n0[16])
+{
+	uint8_t frame[217] = {0};
+	struct ks_kdp_element e;
+
+	kdp_request(&e, sta, NULL, 0, n0, fx_bss[bss]);
+	memcpy(e.raw + 0x9b, "\x00\x0f\xac\x02", 4);
+	frame[12] = frame[13] = 0xee; frame[0x20] = 0xa0;
+	ks_put_be32(frame + 0x2a, KS_KDP_ELEMENT_LEN);
+	memcpy(frame + 0x32, e.raw, sizeof(e.raw));
+	return ks_mtk_test_packet(s, frame, sizeof(frame), 10 + (int) bss) == 1 ? 0 : -1;
+}
+
+static int fx_key_frame(struct ks_state *s, uint8_t subtype, unsigned int bss, const uint8_t sta[6],
+			const uint8_t n0[16], uint32_t n, uint8_t *frame, size_t *flen)
+{
+	uint8_t key[32], auth[256], plain[256], seq[12], pair[2], exp[2], n1[16], pmk[32];
+	uint32_t now = (uint32_t) (ks_now_ms() / 1000);
+	size_t i, alen = 0, plen = 0;
+
+	fx_key(key);
+	memset(n1, 0x41, sizeof(n1)); memset(pmk, 0x42, sizeof(pmk));
+	ks_put_le32(seq, 0x12345679); ks_put_le32(seq + 4, n); ks_put_le32(seq + 8, now);
+	s->cfg.ft_peers[0].rx_domain = 0x12345679;
+	s->cfg.ft_peers[0].rx_count = 1; s->cfg.ft_peers[0].rx_last[0] = n - 1;
+	ks_put_le16(pair, 0x10); ks_put_le16(exp, 90);
+	if (subtype == 2) {
+		for (i = 0; i < KS_MAX_RRB_PENDING; i++)
+			if (s->pull_pending[i].used && !memcmp(s->pull_pending[i].sta, sta, 6)) break;
+		if (i == KS_MAX_RRB_PENDING ||
+		    put_tlv(auth, sizeof(auth), &alen, 2, s->pull_pending[i].nonce, 16)) return -1;
+	}
+	if (put_tlv(auth, sizeof(auth), &alen, 1, seq, sizeof(seq)) ||
+	    put_tlv(auth, sizeof(auth), &alen, 4, "ac0065", 6) ||
+	    put_tlv(auth, sizeof(auth), &alen, 5, fx_bss[bss], 6) ||
+	    put_tlv(plain, sizeof(plain), &plen, 6, sta, 6) ||
+	    (subtype == 3 && put_tlv(plain, sizeof(plain), &plen, 7, n0, 16)) ||
+	    put_tlv(plain, sizeof(plain), &plen, 10, pmk, 32) ||
+	    put_tlv(plain, sizeof(plain), &plen, 9, n1, 16) ||
+	    put_tlv(plain, sizeof(plain), &plen, 11, pair, 2) ||
+	    put_tlv(plain, sizeof(plain), &plen, 12, exp, 2)) return -1;
+	return ks_rrb_build(subtype, fx_peer, fx_local, key, auth, alen, plain, plen,
+			    frame, 768, flen);
+}
+
+static int fx_inserted_akm(uint8_t akm[4])
+{
+	struct ks_kdp_element e;
+
+	if (mock_priv_oid != KS_OID_FT_INSERT || mock_priv_len != KS_KDP_WRAPPER_LEN ||
+	    ks_kdp_parse_element(mock_priv + 12, KS_KDP_ELEMENT_LEN, &e) ||
+	    memcmp(e.raw + 0x97, "\x00\x0f\xac\x04", 4)) return -1;
+	memcpy(akm, ks_kdp_akm(&e), 4);
+	ks_secure_clear(&e, sizeof(e));
+	return 0;
+}
+
+static int test_ft_akm(void)
+{
+	static struct ks_state s;
+	static const struct { uint32_t map; bool error; const uint8_t *want; } pull[] = {
+		{ 0x00000280, false, fx_ft_psk },
+		{ 0x00000200, false, fx_ft_psk },
+		{ 0x00002280, false, fx_ft_psk },
+		{ 0x00006000, false, fx_ft_sae },
+		{ 0x00004000, false, fx_ft_sae },
+		{ 0x00000000, false, fx_ft_sae },
+		{ 0x00000080, false, fx_ft_sae },
+		{ 0x00002000, false, fx_ft_sae },
+		{ 0x00000140, false, fx_ft_sae },
+		{ 0x00006280, false, fx_ft_sae },
+		{ 0x00000280, true, fx_ft_sae },
+	};
+	uint8_t sta[6] = { 0x02, 0xa1, 1, 2, 3, 4 }, n0[16], n1[16], pmk[32], akm[4], frame[768];
+	struct ks_kdp_element e, assoc, parsed;
+	unsigned int rrb, ioctls;
+	size_t i, j, flen;
+	uint32_t n = 100, corr;
+
+	memset(n0, 0x31, sizeof(n0)); memset(n1, 0x41, sizeof(n1)); memset(pmk, 0x42, sizeof(pmk));
+	CHECK(!ks_kdp_from_rrb(&e, sta, (const uint8_t *) "x", 1, n0, fx_bss[0], n1, pmk,
+			       fx_peer, 0x10, 120, NULL));
+	CHECK(!memcmp(ks_kdp_akm(&e), fx_ft_sae, 4));
+	CHECK(!ks_kdp_from_rrb(&e, sta, (const uint8_t *) "x", 1, n0, fx_bss[0], n1, pmk,
+			       fx_peer, 0x10, 120, (const uint8_t[4]) {0}));
+	CHECK(!memcmp(ks_kdp_akm(&e), fx_ft_sae, 4));
+	CHECK(!ks_kdp_from_rrb(&e, sta, (const uint8_t *) "x", 1, n0, fx_bss[0], n1, pmk,
+			       fx_peer, 0x10, 120, fx_ft_psk));
+	CHECK(!memcmp(ks_kdp_akm(&e), fx_ft_psk, 4));
+
+	mock_wext = mock_priv_on = true;
+	for (i = 0; i < sizeof(pull) / sizeof(pull[0]); i++) {
+		for (j = 0; j < 2; j++) {
+			fx_state(&s); s.ioctl_fd = 1; ks_mtk_test_reset();
+			mock_sta_rsn = pull[i].map; mock_sta_rsn_error = pull[i].error;
+			mock_sta_rsn_calls = 0; mock_priv_oid = 0;
+			CHECK(!fx_miss(&s, (unsigned int) j, sta, n0));
+			CHECK(mock_sta_rsn_calls == 1 && mock_priv_oid == 0x0551 && mock_priv_len == 22);
+			CHECK(!strcmp(mock_priv_if, j ? "rax0" : "ra0"));
+			CHECK(!memcmp(mock_priv, sta, 6) && !memcmp(mock_priv + 6, (uint8_t[16]) {0}, 16));
+			ks_mtk_test_counts(&rrb, &ioctls);
+			CHECK(rrb == 1 && !ioctls && s.pull_pending[0].used);
+			CHECK(!fx_key_frame(&s, 2, (unsigned int) j, sta, n0, n++, frame, &flen));
+			CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+			CHECK(!fx_inserted_akm(akm) && !memcmp(akm, pull[i].want, 4));
+			CHECK(!s.pull_pending[0].used);
+			CHECK(!memcmp(s.pull_pending[0].akm, (uint8_t[4]) {0}, 4));
+		}
+	}
+
+	fx_state(&s); s.ioctl_fd = 1; ks_mtk_test_reset();
+	mock_sta_rsn = 0x280; mock_sta_rsn_error = false; mock_sta_rsn_calls = 0;
+	CHECK(!fx_miss(&s, 0, sta, n0));
+	mock_sta_rsn = 0;
+	CHECK(!fx_miss(&s, 0, sta, n0));
+	ks_mtk_test_counts(&rrb, NULL);
+	CHECK(rrb == 1 && mock_sta_rsn_calls == 2 && !memcmp(s.pull_pending[0].akm, fx_ft_psk, 4));
+	ks_rrb_expire(&s, ks_now_ms() + 11000);
+	CHECK(!s.pull_pending[0].used && !memcmp(s.pull_pending[0].akm, (uint8_t[4]) {0}, 4));
+
+	fx_state(&s); s.ioctl_fd = 1; ks_mtk_test_reset();
+	mock_sta_rsn = 0x280; mock_sta_rsn_calls = 0; mock_priv_oid = 0;
+	CHECK(!fx_key_frame(&s, 3, 0, sta, n0, n++, frame, &flen));
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	CHECK(!mock_sta_rsn_calls && !fx_inserted_akm(akm) && !memcmp(akm, fx_ft_sae, 4));
+
+	fx_state(&s); s.ioctl_fd = 1; ks_mtk_test_reset();
+	corr = s.cfg.ft_peers[0].peer_ip.s_addr;
+	kdp_request(&assoc, sta, NULL, 0, n0, fx_peer);
+	CHECK(ks_kdp_prewarm_event(&s, 0, &assoc) == 1);
+	CHECK(!ks_kdp_from_rrb(&e, sta, (const uint8_t *) fx_r0[0], strlen(fx_r0[0]), n0, fx_peer, n1, pmk,
+			       fx_bss[0], 0x10, 120, fx_ft_psk));
+	CHECK(!ks_kdp_parse_element(e.raw, sizeof(e.raw), &parsed));
+	CHECK(!ks_kdp_handle_response(&s, 10, corr, &parsed) && !s.kdp_pending[0].used);
+	ks_mtk_test_counts(&rrb, NULL);
+	CHECK(rrb == 1);
+	mock_wext = mock_priv_on = false; mock_sta_rsn = 0;
+	ks_secure_clear(&e, sizeof(e)); ks_secure_clear(&parsed, sizeof(parsed));
+	ks_secure_clear(pmk, sizeof(pmk)); ks_secure_clear(mock_priv, sizeof(mock_priv));
 	return 0;
 }
 
@@ -1958,6 +2122,8 @@ int main(void)
 	if (test_rrb_resync()) return 1;
 	n++;
 	if (test_rrb_logging()) return 1;
+	n++;
+	if (test_ft_akm()) return 1;
 	n++;
 	if (test_sink_probe()) return 1;
 	n++;

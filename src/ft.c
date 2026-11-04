@@ -462,7 +462,7 @@ static int handle_key_record(struct ks_state *s, int pi, const struct ks_rrb_mes
 	expires = ks_get_le16(exp); if (!expires || ks_get_le16(pair) != 0x10) return -1;
 	bss = ks_bss_by_r1kh(s, r1); if (bss < 0 || !s->cfg.bss[bss].mtk_kdp) return -1;
 	if (ks_kdp_from_rrb(&e, sta, r0, (size_t) r0n, n0, r1, n1, key,
-			    s->cfg.ft_peers[pi].bssid, 0x10, expires)) return -1;
+			    s->cfg.ft_peers[pi].bssid, 0x10, expires, NULL)) return -1;
 	if (ks_backend_ft_insert(s, bss, s->cfg.ft_peers[pi].peer_ip, &e)) {
 		ks_secure_clear(&e, sizeof(e)); return -1;
 	}
@@ -562,7 +562,7 @@ static int handle_pull_resp(struct ks_state *s, int pi,
 	if (ks_get_le16(pair) != 0x10 || !expires ||
 	    ks_kdp_from_rrb(&e, sta, r0, (size_t) r0n,
 	                    pending->pmkr0name, r1, n1, key,
-	                    s->cfg.ft_peers[pi].bssid, 0x10, expires)) {
+	                    s->cfg.ft_peers[pi].bssid, 0x10, expires, pending->akm)) {
 		ks_secure_clear(pending, sizeof(*pending));
 		return -1;
 	}
@@ -734,6 +734,7 @@ static int send_pull_peer(struct ks_state *s, int target_bss,
 	memcpy(pending->nonce, nonce, 16);
 	memcpy(pending->sta, ks_kdp_sta(e), 6);
 	memcpy(pending->pmkr0name, ks_kdp_pmkr0name(e), 16);
+	memcpy(pending->akm, ks_kdp_akm(e), 4);
 	pending->peer_index = (int) pi;
 	pending->target_bss = target_bss;
 	pending->deadline_ms = now + 10000;

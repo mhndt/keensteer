@@ -30,6 +30,7 @@
 #define KS_OID_FT_QUERY   0x8409
 #define KS_OID_FT_INSERT  0x840a
 #define KS_OID_FT_NEIGHBOR 0x840e
+#define KS_OID_STA_RSN    0x0551
 
 #define KS_KDP_ELEMENT_LEN 167
 #define KS_KDP_WRAPPER_LEN 179
@@ -167,6 +168,7 @@ struct ks_pull_pending {
 	uint8_t nonce[16];
 	uint8_t sta[6];
 	uint8_t pmkr0name[16];
+	uint8_t akm[4];
 	int peer_index;
 	int target_bss;
 	uint64_t deadline_ms;
@@ -338,13 +340,14 @@ const uint8_t *ks_kdp_r1kh(const struct ks_kdp_element *e);
 const uint8_t *ks_kdp_pmkr1name(const struct ks_kdp_element *e);
 const uint8_t *ks_kdp_pmkr1(const struct ks_kdp_element *e);
 const uint8_t *ks_kdp_r0kh_mac(const struct ks_kdp_element *e);
+const uint8_t *ks_kdp_akm(const struct ks_kdp_element *e);
 uint32_t ks_kdp_lifetime(const struct ks_kdp_element *e);
 int ks_kdp_from_rrb(struct ks_kdp_element *e, const uint8_t sta[6],
 		    const uint8_t *r0kh_id, size_t r0kh_len,
 		    const uint8_t pmkr0name[16], const uint8_t target_r1kh[6],
 		    const uint8_t pmkr1name[16], const uint8_t pmkr1[32],
 		    const uint8_t r0kh_mac[6], uint16_t pairwise,
-		    uint32_t expires);
+		    uint32_t expires, const uint8_t *akm);
 
 int ks_rrb_expand_key(const uint8_t old_key[16], uint8_t out[32]);
 int ks_aes_siv_encrypt(const uint8_t key[32], const uint8_t *plain,

@@ -191,6 +191,8 @@ uci set wireless.$WIFI.ieee80211k='1'
 uci set wireless.$WIFI.bss_transition='1'
 ```
 
+WPA2 clients need Generate PMK locally and PMK R1 Push disabled: the Keenetic then requests the key when the client roams and stamps it FT-PSK.
+
 If the roaming fields are missing in LuCI, install a wpad package with WPA3/SAE and 802.11r support, such as wpad-basic-openssl. usteer uses the 802.11k neighbor reports and 802.11v transition requests to steer clients instead of disconnecting them.
 
 ## 6. Add the OpenWrt R0KH and R1KH entries

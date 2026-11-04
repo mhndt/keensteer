@@ -38,6 +38,9 @@
 #define RX_UNKNOWN UINT64_MAX
 #define KDP_RESPONSE_INTERFACE 1
 #define KDP_RESPONSE_NAME 2
+#define STA_RSN_LEN 22
+#define STA_AKM_FT_PSK 0x0200u
+#define STA_AKM_FT_SAE 0x4000u
 
 #ifdef KS_TEST
 static uint8_t test_rrb[KS_MAX_PACKET], test_ioctl[KS_KDP_WRAPPER_LEN];
@@ -626,6 +629,8 @@ int ks_backend_send_rrb(struct ks_state *s, const uint8_t dst[6],
 	return sendto(s->packet_fd, frame, len, 0, (struct sockaddr *) &ll, sizeof(ll)) == (ssize_t) len ? 0 : -1;
 }
 
+static void kdp_sta_akm(struct ks_state *s, int bss, struct ks_kdp_element *e);
+
 static int handle_packet(struct ks_state *s, const uint8_t *frame, size_t n,
 			 int ifindex)
 {
@@ -645,7 +650,10 @@ static int handle_packet(struct ks_state *s, const uint8_t *frame, size_t n,
 		} else if (n > 0x20 && frame[0x20] == 0xa0) {
 			if (!ks_kdp_parse_signala0(frame, n, &e)) {
 				bss = ks_bss_by_r1kh(s, ks_kdp_r1kh(&e));
-				if (bss >= 0) ks_rrb_send_pull(s, bss, &e);
+				if (bss >= 0) {
+					kdp_sta_akm(s, bss, &e);
+					ks_rrb_send_pull(s, bss, &e);
+				}
 			}
 		} else if (!ks_kdp_parse_signala1(frame, n, &corr, &e))
 			ks_kdp_handle_response(s, ifindex, corr, &e);
@@ -977,6 +985,23 @@ int ks_kdp_build_wrapper(uint32_t correlation, const struct ks_kdp_element *elem
 	return 0;
 }
 
+static void kdp_sta_akm(struct ks_state *s, int bss, struct ks_kdp_element *e)
+{
+	uint8_t rsn[STA_RSN_LEN] = {0};
+	uint32_t akm = 0;
+	char mac[18];
+
+	memset(e->raw + KDP_AKM, 0, 4);
+	memcpy(rsn, e->raw + KDP_STA, 6);
+	if (!priv_ioctl(s, bss, KS_OID_STA_RSN, rsn, sizeof(rsn))) memcpy(&akm, rsn + 6, 4);
+	akm &= STA_AKM_FT_PSK | STA_AKM_FT_SAE;
+	if (akm == STA_AKM_FT_PSK) memcpy(e->raw + KDP_AKM, ft_psk, 4);
+	else if (akm == STA_AKM_FT_SAE) memcpy(e->raw + KDP_AKM, ft_sae, 4);
+	ks_mac_format(e->raw + KDP_STA, mac);
+	ks_log(KS_LOG_DEBUG, "AKM of %s on %s: %s", mac, s->cfg.bss[bss].ifname,
+	       akm == STA_AKM_FT_PSK ? "FT-PSK" : akm == STA_AKM_FT_SAE ? "FT-SAE" : "unknown");
+}
+
 static struct ks_kdp_pending *pending_new(struct ks_state *s)
 {
 	size_t i;
@@ -1240,6 +1265,7 @@ const uint8_t *ks_kdp_r1kh(const struct ks_kdp_element *e) { return e->raw + KDP
 const uint8_t *ks_kdp_pmkr1name(const struct ks_kdp_element *e) { return e->raw + KDP_PMKR1NAME; }
 const uint8_t *ks_kdp_pmkr1(const struct ks_kdp_element *e) { return e->raw + KDP_PMK_R1; }
 const uint8_t *ks_kdp_r0kh_mac(const struct ks_kdp_element *e) { return e->raw + KDP_R0KH_MAC; }
+const uint8_t *ks_kdp_akm(const struct ks_kdp_element *e) { return e->raw + KDP_AKM; }
 uint32_t ks_kdp_lifetime(const struct ks_kdp_element *e) { return ks_get_le32(e->raw + KDP_LIFETIME); }
 
 int ks_kdp_from_rrb(struct ks_kdp_element *e, const uint8_t sta[6],
@@ -1247,7 +1273,7 @@ int ks_kdp_from_rrb(struct ks_kdp_element *e, const uint8_t sta[6],
 		    const uint8_t pmkr0name[16], const uint8_t target_r1kh[6],
 		    const uint8_t pmkr1name[16], const uint8_t pmkr1[32],
 		    const uint8_t r0kh_mac[6], uint16_t pairwise,
-		    uint32_t expires)
+		    uint32_t expires, const uint8_t *akm)
 {
 	if (!e || !sta || !ks_mac_unicast(sta) || !r0kh_id || !r0kh_len ||
 	    r0kh_len > KS_MAX_R0KH_ID || !target_r1kh || !ks_mac_unicast(target_r1kh) ||
@@ -1268,7 +1294,7 @@ int ks_kdp_from_rrb(struct ks_kdp_element *e, const uint8_t sta[6],
 	memcpy(e->raw + KDP_PMK_R1, pmkr1, 32);
 	memcpy(e->raw + KDP_R0KH_MAC, r0kh_mac, 6);
 	memcpy(e->raw + KDP_PAIRWISE, ccmp, 4);
-	memcpy(e->raw + KDP_AKM, ft_sae, 4);
+	memcpy(e->raw + KDP_AKM, akm && !all_zero(akm, 4) ? akm : ft_sae, 4);
 	ks_put_le32(e->raw + KDP_LIFETIME, expires);
 	ks_put_le32(e->raw + KDP_REASSOC, 20);
 	return 0;
