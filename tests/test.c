@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -298,7 +299,12 @@ static int test_usteer(void)
 	CHECK(!next_attr(rrm.data, rrm.len, &off, &array) && array.id == 1 && array.len >= 4);
 	off = 0;
 	CHECK(!next_attr(array.data + 4, array.len - 4, &off, &str) && str.id == 3 && str.len > 4);
-	CHECK(str.data[4 + 12] == '0' && str.data[4 + 13] == '0');
+	CHECK(!strcmp((const char *) str.data + 4, "02:10:20:30:40:50"));
+	CHECK(!next_attr(array.data + 4, array.len - 4, &off, &str) && str.id == 3 && str.len > 4);
+	CHECK(!strcmp((const char *) str.data + 4, "test-ess"));
+	CHECK(!next_attr(array.data + 4, array.len - 4, &off, &str) && str.id == 3 && str.len > 4);
+	CHECK(!strcmp((const char *) str.data + 4, "0210203040500f000000510107"));
+	CHECK(off == array.len - 4);
 
 	memset(&rx, 0, sizeof(rx));
 	ks_config_defaults(&rx.cfg);
@@ -1553,6 +1559,372 @@ static int test_backend(void)
 	return 0;
 }
 
+static int test_reconcile_heard(void)
+{
+	static struct ks_state s;
+	struct ks_station *st;
+	static char t0[4096], t1[256];
+	uint8_t a[6] = { 0x02, 1, 2, 3, 4, 5 }, buf[KS_MAX_PACKET];
+	uint64_t real = ks_now_ms(), now = real, first = real;
+	size_t len;
+	struct attr sta, node, f;
+
+	sample_state(&s, 2);
+	memset(s.stations, 0, sizeof(s.stations));
+	strcpy(s.cfg.bss[0].ifname, "ra0"); strcpy(s.cfg.bss[1].ifname, "ra8");
+	s.ioctl_fd = 1; mock_wext = true;
+	strcpy(mock_table[0].ifname, "ra0"); strcpy(mock_table[1].ifname, "ra8");
+	mock_table[0].text = t0; mock_table[1].text = t1;
+	mock_table[0].error = mock_table[1].error = false; mock_table_len = 0;
+	strcpy(t1, "\nMAC AP RxB RSSI\n");
+	strcpy(t0, "\nMAC AP RxB RSSI\n020102030405 0 5000 -60\n");
+	s.next_reconcile_ms = 0; s.reconcile_off = false;
+	CHECK(!ks_backend_reconcile(&s, now));
+	st = ks_station_get(&s, a, false);
+	CHECK(st && st->connected && st->heard_ms[0] == now && st->seen_ms[0] == now &&
+	      st->rx_bytes == 5000);
+
+	now += 60000;
+	CHECK(!ks_backend_reconcile(&s, now));
+	CHECK(st->connected && st->seen_ms[0] == now && st->heard_ms[0] == first);
+
+	strcpy(t0, "\nMAC AP RxB RSSI\n020102030405 0 5 -61\n");
+	now += 60000;
+	CHECK(!ks_backend_reconcile(&s, now));
+	CHECK(st->heard_ms[0] == now && st->signal[0] == -61 && st->rx_bytes == 5);
+
+	strcpy(t0, "\nMAC AP RxB RSSI\n020102030405 0 6 -61\n");
+	now += 60000;
+	CHECK(!ks_backend_reconcile(&s, now));
+	CHECK(st->heard_ms[0] == now && st->rx_bytes == 6);
+
+	first = now;
+	now += 60000;
+	CHECK(!ks_backend_reconcile(&s, now));
+	CHECK(st->heard_ms[0] == first);
+
+	real = ks_now_ms();
+	CHECK(real > 1);
+	st->heard_ms[0] = 1; st->seen_ms[0] = real;
+	st->signal[0] = -61;
+	CHECK(!ks_usteer_encode(&s, buf, sizeof(buf), &len));
+	CHECK(!first_station(buf, len, &sta, &node));
+	CHECK(find_attr(sta.data, sta.len, 3, 4, &f) == 1 && ks_get_be32(f.data) >= real - 1);
+	CHECK(find_attr(sta.data, sta.len, 4, 1, &f) == 1 && f.data[0] == 1);
+	CHECK(find_attr(sta.data, sta.len, 2, 4, &f) == 1 && (int32_t) ks_get_be32(f.data) > 0);
+
+	strcpy(t0, "\nMAC AP RSSI\n020102030405 0 -62\n");
+	st->heard_ms[0] = 1; now += 60000;
+	CHECK(!ks_backend_reconcile(&s, now));
+	CHECK(st->heard_ms[0] == now && st->rx_bytes == UINT64_MAX);
+	st->heard_ms[0] = 1; now += 60000;
+	CHECK(!ks_backend_reconcile(&s, now));
+	CHECK(st->heard_ms[0] == now);
+
+	strcpy(t0, "\nMAC AP RxB RSSI\n020102030405 0 12x -62\n");
+	st->heard_ms[0] = 1; now += 60000;
+	CHECK(!ks_backend_reconcile(&s, now));
+	CHECK(st->heard_ms[0] == now && st->rx_bytes == UINT64_MAX);
+
+	strcpy(t0, "\nMAC AP RxB RSSI\n020102030405 0 18446744073709551615 -62\n");
+	st->heard_ms[0] = 1; now += 60000;
+	CHECK(!ks_backend_reconcile(&s, now));
+	CHECK(st->heard_ms[0] == now && st->rx_bytes == UINT64_MAX);
+
+	strcpy(t0, "\nMAC AP RxB RSSI\n");
+	now += 60000;
+	CHECK(!ks_backend_reconcile(&s, now));
+	CHECK(!st->connected && st->connected_ms == now);
+	mock_wext = false;
+	return 0;
+}
+
+static const uint8_t fx_local[6] = { 0x02, 0x50, 0, 0, 0, 1 };
+static const uint8_t fx_peer[6] = { 0x02, 0xac, 0, 0, 0, 0x65 };
+static const uint8_t fx_bss[2][6] = { { 0x02, 0x50, 0, 0, 1, 0 }, { 0x02, 0x52, 0, 0, 1, 1 } };
+static const char *const fx_r0[2] = { "Keenetic-00", "Keenetic-10" };
+
+static void fx_key(uint8_t key[32])
+{
+	size_t i;
+
+	for (i = 0; i < 32; i++) key[i] = (uint8_t) (i + 1);
+}
+
+static void fx_state(struct ks_state *s)
+{
+	struct ks_ft_peer *p;
+	size_t i;
+
+	memset(s, 0, sizeof(*s));
+	ks_config_defaults(&s->cfg);
+	s->packet_fd = s->ioctl_fd = -2;
+	s->transport_ifindex = 1;
+	memcpy(s->transport_mac, fx_local, 6);
+	fx_key(s->rrb_key);
+	s->rrb_key_loaded = true;
+	s->cfg.ft_enabled = true;
+	s->cfg.n_bss = 2;
+	for (i = 0; i < 2; i++) {
+		struct ks_bss *b = &s->cfg.bss[i];
+
+		b->active = b->mtk_kdp = true;
+		b->ifindex = 10 + (int) i;
+		memcpy(b->bssid, fx_bss[i], 6);
+		memcpy(b->r1kh_id, fx_bss[i], 6);
+		strcpy(b->r0kh_id, fx_r0[i]);
+		b->r0kh_id_len = strlen(fx_r0[i]);
+		strcpy(b->ifname, i ? "rax0" : "ra0");
+		strcpy(b->ssid, "x");
+	}
+	s->cfg.n_ft_peers = 1;
+	p = &s->cfg.ft_peers[0];
+	p->used = p->sink_ready = true;
+	memcpy(p->transport, fx_peer, 6);
+	memcpy(p->bssid, fx_peer, 6);
+	memcpy(p->r1kh_id, fx_peer, 6);
+	strcpy(p->r0kh_id, "ac0065");
+	p->r0kh_id_len = 6;
+	inet_pton(AF_INET, "192.0.2.22", &p->peer_ip);
+}
+
+static int fx_pull(uint8_t *frame, size_t *flen, const uint8_t key[32], const uint8_t src[6],
+		   unsigned int bss, uint32_t dom, uint32_t n, uint32_t ts, uint8_t tag)
+{
+	uint8_t nonce[16], n0[16], seq[12], sta[6] = { 0x02, 0xa0, 1, 2, 3, 0 };
+
+	memset(nonce, tag, sizeof(nonce));
+	memset(n0, tag + 1, sizeof(n0));
+	sta[5] = tag;
+	ks_put_le32(seq, dom); ks_put_le32(seq + 4, n); ks_put_le32(seq + 8, ts);
+	return pull_frame(key, src, fx_local, nonce, seq, (const uint8_t *) fx_r0[bss],
+			  strlen(fx_r0[bss]), fx_peer, n0, sta, frame, flen);
+}
+
+static int fx_last_is_seq_req(void)
+{
+	uint8_t last[KS_MAX_PACKET];
+	size_t len;
+	struct ks_rrb_message m;
+
+	if (ks_mtk_test_last_rrb(last, sizeof(last), &len) || ks_rrb_parse_frame(last, len, &m))
+		return 0;
+	return m.subtype == 4;
+}
+
+static int fx_answer_seq(struct ks_state *s, const uint8_t key[32], uint32_t dom, uint32_t n,
+			 uint32_t ts)
+{
+	uint8_t last[KS_MAX_PACKET], auth[256], seq[12], frame[768];
+	const uint8_t *nonce, *r0;
+	size_t len, alen = 0, nlen, r0n, flen;
+	struct ks_rrb_message m;
+
+	if (ks_mtk_test_last_rrb(last, sizeof(last), &len) || ks_rrb_parse_frame(last, len, &m) ||
+	    m.subtype != 4 || get_tlv(m.auth, m.auth_len, 2, &nonce, &nlen) != 1 ||
+	    get_tlv(m.auth, m.auth_len, 4, &r0, &r0n) != 1) return -1;
+	ks_put_le32(seq, dom); ks_put_le32(seq + 4, n); ks_put_le32(seq + 8, ts);
+	if (put_tlv(auth, sizeof(auth), &alen, 2, nonce, nlen) ||
+	    put_tlv(auth, sizeof(auth), &alen, 1, seq, 12) ||
+	    put_tlv(auth, sizeof(auth), &alen, 4, r0, r0n) ||
+	    put_tlv(auth, sizeof(auth), &alen, 5, fx_peer, 6) ||
+	    ks_rrb_build(5, fx_peer, fx_local, key, auth, alen, NULL, 0, frame, sizeof(frame), &flen))
+		return -1;
+	return ks_rrb_handle_frame(s, frame, flen);
+}
+
+static int test_rrb_resync(void)
+{
+	static struct ks_state s;
+	uint8_t key[32], frame[768];
+	size_t flen;
+	uint32_t now = (uint32_t) (ks_now_ms() / 1000), na = 1000, nb = 5000;
+	unsigned int before, rrb, io, i, reqs;
+
+	fx_key(key);
+
+	fx_state(&s); ks_mtk_test_reset(); reqs = 0;
+	for (i = 0; i < 6; i++) {
+		bool a = !(i & 1);
+		uint32_t dom = a ? 0xaaaaaaa1u : 0xbbbbbbb1u;
+
+		ks_mtk_test_counts(&before, &io);
+		CHECK(!fx_pull(frame, &flen, key, fx_peer, a ? 0 : 1, dom, a ? na++ : nb++, now,
+			       (uint8_t) (0x10 + i)));
+		ks_rrb_handle_frame(&s, frame, flen);
+		ks_mtk_test_counts(&rrb, &io);
+		if (rrb > before && fx_last_is_seq_req()) {
+			reqs++;
+			CHECK(!fx_answer_seq(&s, key, dom, a ? na++ : nb++, now));
+		}
+	}
+	ks_mtk_test_counts(&rrb, &io);
+	CHECK(reqs == 6 && io == 6);
+
+	fx_state(&s); ks_mtk_test_reset(); reqs = 0; na = 1000;
+	for (i = 0; i < 6; i++) {
+		ks_mtk_test_counts(&before, &io);
+		CHECK(!fx_pull(frame, &flen, key, fx_peer, 0, 0xaaaaaaa1u, na++, now,
+			       (uint8_t) (0x30 + i)));
+		ks_rrb_handle_frame(&s, frame, flen);
+		ks_mtk_test_counts(&rrb, &io);
+		if (rrb > before && fx_last_is_seq_req()) {
+			reqs++;
+			CHECK(!fx_answer_seq(&s, key, 0xaaaaaaa1u, na++, now));
+		}
+	}
+	ks_mtk_test_counts(&rrb, &io);
+	CHECK(reqs == 1 && io == 6);
+
+	fx_state(&s); ks_mtk_test_reset();
+	CHECK(!fx_pull(frame, &flen, key, fx_peer, 0, 0xaaaaaaa1u, 1000, now - 100, 0x61));
+	ks_rrb_handle_frame(&s, frame, flen);
+	CHECK(fx_last_is_seq_req());
+	ks_mtk_test_counts(&before, &io);
+	CHECK(before == 1);
+	CHECK(!fx_answer_seq(&s, key, 0xaaaaaaa1u, 2000, now));
+	ks_mtk_test_counts(&rrb, &io);
+	CHECK(rrb == 1 && io == 0);
+	for (i = 0; i < KS_MAX_RRB_PENDING; i++) CHECK(!s.rrb_pending[i].used);
+
+	fx_state(&s); ks_mtk_test_reset();
+	CHECK(!fx_pull(frame, &flen, key, fx_peer, 0, 0xaaaaaaa1u, 1000, now, 0x51));
+	ks_rrb_handle_frame(&s, frame, flen);
+	CHECK(fx_last_is_seq_req());
+	CHECK(!fx_answer_seq(&s, key, 0xaaaaaaa1u, 1001, now));
+	ks_mtk_test_counts(&rrb, &io);
+	CHECK(rrb == 1 && io == 1);
+	ks_kdp_expire(&s, ks_now_ms() + 100000);
+	ks_mtk_test_counts(&before, &io);
+	ks_rrb_handle_frame(&s, frame, flen);
+	ks_mtk_test_counts(&rrb, &io);
+	CHECK(rrb == before && io == 1);
+	return 0;
+}
+
+static int test_rrb_logging(void)
+{
+	static struct ks_state s;
+	static const uint8_t stranger[6] = { 0x02, 0x99, 0, 0, 0, 7 };
+	uint8_t key[32], bad[32], frame[768], first[768], pmk[32], n0[16], n1[16];
+	uint8_t sta[6] = { 0x02, 0xa0, 1, 2, 3, 4 };
+	size_t flen, first_len;
+	uint32_t now = (uint32_t) (ks_now_ms() / 1000);
+	unsigned int i, count;
+	struct ks_kdp_element e;
+	struct in_addr source;
+
+	fx_key(key);
+	memcpy(bad, key, sizeof(bad)); bad[0] ^= 0xff;
+
+	fx_state(&s); ks_mtk_test_reset();
+	ks_test_log_count = 0;
+	CHECK(!fx_pull(frame, &flen, key, stranger, 0, 1, 1, now, 0x21));
+	for (i = 0; i < 1000; i++) CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	CHECK(ks_test_log_count == 1);
+	CHECK(!strcmp(ks_test_log, "RRB from 02:99:00:00:00:07: no matching peer"));
+	s.log_rrb_peer.next_ms = ks_now_ms();
+	CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	CHECK(ks_test_log_count == 2);
+	CHECK(!strcmp(ks_test_log, "RRB from 02:99:00:00:00:07: no matching peer (999 suppressed)"));
+
+	CHECK(!fx_pull(frame, &flen, bad, fx_peer, 0, 1, 1, now, 0x22));
+	for (i = 0; i < 1000; i++) CHECK(!ks_rrb_handle_frame(&s, frame, flen));
+	CHECK(ks_test_log_count == 3);
+	CHECK(!strcmp(ks_test_log, "RRB from 02:ac:00:00:00:65: decrypt failed"));
+
+	fx_state(&s); ks_mtk_test_reset();
+	CHECK(!fx_pull(first, &first_len, key, fx_peer, 0, 0xaaaaaaa1u, 1000, now, 0x23));
+	ks_rrb_handle_frame(&s, first, first_len);
+	CHECK(!fx_answer_seq(&s, key, 0xaaaaaaa1u, 1001, now));
+	ks_kdp_expire(&s, ks_now_ms() + 100000);
+	count = ks_test_log_count;
+	CHECK(ks_rrb_handle_frame(&s, first, first_len) < 0);
+	CHECK(ks_test_log_count == count);
+	ks_log_threshold = KS_LOG_DEBUG;
+	CHECK(ks_rrb_handle_frame(&s, first, first_len) < 0);
+	ks_log_threshold = KS_LOG_INFO;
+	CHECK(ks_test_log_count == count + 1);
+	CHECK(!strcmp(ks_test_log, "RRB from 02:ac:00:00:00:65: type 1 dropped"));
+
+	fx_state(&s); s.ioctl_fd = -1;
+	for (i = 0; i < 32; i++) pmk[i] = (uint8_t) (0xa0 + i);
+	memset(n0, 0x31, sizeof(n0)); memset(n1, 0x32, sizeof(n1));
+	CHECK(!ks_kdp_from_rrb(&e, sta, (const uint8_t *) "x", 1, n0, fx_bss[0], n1, pmk,
+			       fx_peer, 0x10, 120));
+	source.s_addr = htonl(0xc0000216);
+	ks_test_log_count = 0;
+	for (i = 0; i < 1000; i++) CHECK(ks_backend_ft_insert(&s, 0, source, &e) < 0);
+	CHECK(ks_test_log_count == 1);
+	CHECK(!strcmp(ks_test_log, "FT key insert failed on ra0 for 02:a0:01:02:03:04"));
+	return 0;
+}
+
+static int test_sink_probe(void)
+{
+	static struct ks_state s;
+	struct ks_sink *k = &s.sinks[0];
+	struct sockaddr_in sin;
+	uint64_t now;
+	int one = 1, lfd, p[2];
+	unsigned int i;
+
+	memset(&s, 0, sizeof(s));
+	ks_config_defaults(&s.cfg);
+	s.cfg.ft_enabled = true;
+	s.cfg.n_ft_peers = 1;
+	s.cfg.ft_peers[0].used = true;
+	CHECK(inet_pton(AF_INET, "127.0.0.2", &s.cfg.ft_peers[0].peer_ip) == 1);
+	k->addr = s.cfg.ft_peers[0].peer_ip;
+	k->fd = -1;
+	s.n_sinks = 1;
+
+	lfd = socket(AF_INET, SOCK_STREAM, 0);
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons(3517);
+	sin.sin_addr = k->addr;
+	CHECK(lfd >= 0 && !setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) &&
+	      !bind(lfd, (struct sockaddr *) &sin, sizeof(sin)) && !listen(lfd, 8));
+
+	now = ks_now_ms();
+	ks_backend_reprobe(&s, now);
+	for (i = 0; k->fd >= 0 && i < 2000; i++) {
+		poll(NULL, 0, 1);
+		ks_backend_reprobe(&s, now);
+	}
+	CHECK(k->fd < 0 && k->ready && k->checked && s.cfg.ft_peers[0].sink_ready);
+	CHECK(k->next_probe_ms == now + 30000);
+	ks_backend_reprobe(&s, now + 29999);
+	CHECK(k->fd < 0 && k->ready);
+
+	close(lfd);
+	now += 30000;
+	ks_backend_reprobe(&s, now);
+	for (i = 0; k->fd >= 0 && i < 2000; i++) {
+		poll(NULL, 0, 1);
+		ks_backend_reprobe(&s, now);
+	}
+	CHECK(k->fd < 0 && !k->ready && !s.cfg.ft_peers[0].sink_ready);
+	CHECK(k->next_probe_ms == now + 30000);
+
+	CHECK(!pipe(p));
+	k->fd = p[0];
+	k->deadline_ms = now + 500;
+	k->ready = true;
+	ks_backend_reprobe(&s, now + 499);
+	CHECK(k->fd == p[0] && k->ready);
+	ks_backend_reprobe(&s, now + 500);
+	CHECK(k->fd < 0 && !k->ready && k->next_probe_ms == now + 30500);
+	close(p[1]);
+
+	CHECK(inet_pton(AF_INET, "127.0.0.1", &k->addr) == 1);
+	k->ready = true; k->next_probe_ms = 0;
+	ks_backend_reprobe(&s, now + 40000);
+	CHECK(k->fd < 0 && !k->ready && k->next_probe_ms == now + 70000);
+	return 0;
+}
+
 int main(void)
 {
 	int n = 0;
@@ -1580,6 +1952,14 @@ int main(void)
 	if (test_reconcile()) return 1;
 	n++;
 	if (test_backend()) return 1;
+	n++;
+	if (test_reconcile_heard()) return 1;
+	n++;
+	if (test_rrb_resync()) return 1;
+	n++;
+	if (test_rrb_logging()) return 1;
+	n++;
+	if (test_sink_probe()) return 1;
 	n++;
 	printf("ok %d groups\n", n);
 	return 0;

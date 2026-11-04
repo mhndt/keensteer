@@ -18,6 +18,13 @@
 
 enum ks_log_level ks_log_threshold = KS_LOG_INFO;
 
+#define KS_LOG_LIMIT_MS 60000
+
+#ifdef KS_TEST
+char ks_test_log[256];
+unsigned int ks_test_log_count;
+#endif
+
 void ks_log(enum ks_log_level level, const char *fmt, ...)
 {
 	static const int priorities[] = { LOG_ERR, LOG_WARNING, LOG_INFO, LOG_DEBUG };
@@ -26,8 +33,33 @@ void ks_log(enum ks_log_level level, const char *fmt, ...)
 	if (level > ks_log_threshold)
 		return;
 	va_start(ap, fmt);
+#ifdef KS_TEST
+	{
+		va_list copy;
+
+		va_copy(copy, ap);
+		vsnprintf(ks_test_log, sizeof(ks_test_log), fmt, copy);
+		va_end(copy);
+		ks_test_log_count++;
+	}
+#endif
 	vsyslog(priorities[level], fmt, ap);
 	va_end(ap);
+}
+
+const char *ks_log_allow(struct ks_log_limit *limit, uint64_t now)
+{
+	static char note[32];
+
+	if (now < limit->next_ms) {
+		limit->suppressed++;
+		return NULL;
+	}
+	note[0] = 0;
+	if (limit->suppressed) snprintf(note, sizeof(note), " (%u suppressed)", limit->suppressed);
+	limit->suppressed = 0;
+	limit->next_ms = now + KS_LOG_LIMIT_MS;
+	return note;
 }
 
 uint64_t ks_now_ms(void)
@@ -189,31 +221,57 @@ static int install_signals(void)
 
 static int drain(struct ks_state *s, int (*fn)(struct ks_state *))
 {
-	int rc;
+	int rc = 0;
 
-	do rc = fn(s); while (rc > 0);
+	for (unsigned int i = 0; i < 32 && !stopped; i++) {
+		rc = fn(s);
+		if (rc <= 0) break;
+	}
 	return rc;
 }
 
 #define DISCOVER_RETRY_MS 60000
+
+static uint64_t next_deadline(const struct ks_state *s, uint64_t next)
+{
+	size_t i;
+
+	for (i = 0; i < KS_MAX_KDP_PENDING; i++)
+		if (s->kdp_pending[i].used && s->kdp_pending[i].deadline_ms < next)
+			next = s->kdp_pending[i].deadline_ms;
+	for (i = 0; i < KS_MAX_RRB_PENDING; i++) {
+		if (s->rrb_pending[i].used && s->rrb_pending[i].deadline_ms < next)
+			next = s->rrb_pending[i].deadline_ms;
+		if (s->pull_pending[i].used && s->pull_pending[i].deadline_ms < next)
+			next = s->pull_pending[i].deadline_ms;
+	}
+	for (i = 0; i < s->n_sinks; i++) {
+		const struct ks_sink *sink = &s->sinks[i];
+		uint64_t due = sink->fd >= 0 ? sink->deadline_ms : sink->next_probe_ms;
+
+		if (due < next) next = due;
+	}
+	return next;
+}
 
 static int run(struct ks_state *s)
 {
 	uint64_t next_expire = ks_now_ms(), next_discover = next_expire + DISCOVER_RETRY_MS;
 
 	while (!stopped) {
-		struct pollfd pfd[3];
+		struct pollfd pfd[3 + KS_MAX_FT_PEERS];
 		uint64_t now, next;
 		nfds_t n = 0;
 		int timeout, rc;
 
 		now = ks_now_ms();
+		ks_backend_reprobe(s, now);
+		ks_kdp_expire(s, now);
+		ks_rrb_expire(s, now);
+		ks_kdp_retry(s, now);
 		if (now >= next_expire) {
 			ks_station_expire(s, now);
 			ks_usteer_expire(s, now);
-			ks_kdp_expire(s, now);
-			ks_rrb_expire(s, now);
-			ks_backend_reprobe(s, now);
 			(void) ks_backend_reconcile(s, now);
 			next_expire = now + 1000;
 		}
@@ -230,9 +288,14 @@ static int run(struct ks_state *s)
 		if (s->packet_fd >= 0) pfd[n++] = (struct pollfd) { s->packet_fd, POLLIN, 0 };
 		if (s->netlink_fd >= 0) pfd[n++] = (struct pollfd) { s->netlink_fd, POLLIN, 0 };
 		if (s->udp_fd >= 0) pfd[n++] = (struct pollfd) { s->udp_fd, POLLIN, 0 };
+		for (size_t i = 0; i < s->n_sinks; i++)
+			if (s->sinks[i].fd >= 0)
+				pfd[n++] = (struct pollfd) { s->sinks[i].fd, POLLOUT, 0 };
 		next = next_expire;
+		if (next_discover < next) next = next_discover;
 		if (s->cfg.usteer_enabled && s->next_usteer_ms < next)
 			next = s->next_usteer_ms;
+		next = next_deadline(s, next);
 		now = ks_now_ms();
 		timeout = next <= now ? 0 : (next - now > INT32_MAX ? INT32_MAX : (int) (next - now));
 		rc = poll(pfd, n, timeout);
@@ -242,7 +305,8 @@ static int run(struct ks_state *s)
 		}
 		for (nfds_t i = 0; i < n && rc > 0; i++) {
 			int io_rc = 0;
-			if (!(pfd[i].revents & (POLLIN | POLLERR | POLLHUP))) continue;
+			if (!(pfd[i].revents & (POLLIN | POLLOUT | POLLERR | POLLHUP | POLLNVAL)))
+				continue;
 			rc--;
 			if (pfd[i].fd == s->packet_fd) io_rc = drain(s, ks_backend_handle_packet);
 			else if (pfd[i].fd == s->netlink_fd) io_rc = drain(s, ks_backend_handle_netlink);

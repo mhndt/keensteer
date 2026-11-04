@@ -32,8 +32,12 @@
 #define BNDSTRG_BAND_2GHZ 2
 #define LOAD_UPDATE_MS 3000
 #define SINK_REPROBE_MS 30000
+#define SINK_TIMEOUT_MS 500
 #define RECONCILE_MS 60000
 #define MAC_TABLE_ROW 140
+#define RX_UNKNOWN UINT64_MAX
+#define KDP_RESPONSE_INTERFACE 1
+#define KDP_RESPONSE_NAME 2
 
 #ifdef KS_TEST
 static uint8_t test_rrb[KS_MAX_PACKET], test_ioctl[KS_KDP_WRAPPER_LEN];
@@ -51,26 +55,28 @@ static int nonblock(int fd)
 	return f < 0 || fcntl(fd, F_SETFL, f | O_NONBLOCK) < 0 ? -1 : 0;
 }
 
-static bool sink_probe(struct in_addr addr)
+static void sink_result(struct ks_state *s, struct ks_sink *sink, bool ready,
+			uint64_t now)
 {
-	struct sockaddr_in sin;
-	struct pollfd pfd;
-	socklen_t len;
-	int fd, error = 0;
+	bool changed = sink->ready != ready;
+	char ip[INET_ADDRSTRLEN];
+	size_t i;
 
-	fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-	if (fd < 0 || nonblock(fd)) { if (fd >= 0) close(fd); return false; }
-	memset(&sin, 0, sizeof(sin)); sin.sin_family = AF_INET;
-	sin.sin_port = htons(3517); sin.sin_addr = addr;
-	if (connect(fd, (struct sockaddr *) &sin, sizeof(sin)) && errno != EINPROGRESS) {
-		close(fd); return false;
+	if (sink->fd >= 0) close(sink->fd);
+	sink->fd = -1;
+	sink->ready = ready;
+	sink->deadline_ms = 0;
+	sink->next_probe_ms = now + SINK_REPROBE_MS;
+	for (i = 0; i < s->cfg.n_ft_peers; i++)
+		if (s->cfg.ft_peers[i].peer_ip.s_addr == sink->addr.s_addr)
+			s->cfg.ft_peers[i].sink_ready = ready;
+	if (changed || !sink->checked) {
+		inet_ntop(AF_INET, &sink->addr, ip, sizeof(ip));
+		ks_log(ready ? KS_LOG_INFO : KS_LOG_WARN,
+		       "KDP source queries %s for %s: TCP/3517 %s",
+		       ready ? "enabled" : "disabled", ip, ready ? "available" : "unavailable");
 	}
-	pfd = (struct pollfd) { fd, POLLOUT, 0 };
-	if (poll(&pfd, 1, 500) != 1) { close(fd); return false; }
-	len = sizeof(error);
-	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len)) error = errno;
-	close(fd);
-	return error == 0;
+	sink->checked = true;
 }
 
 static bool local_ipv4(struct in_addr addr)
@@ -139,6 +145,7 @@ static void close_fd(int *fd)
 int ks_backend_open(struct ks_state *s)
 {
 	s->udp_fd = s->packet_fd = s->netlink_fd = -1;
+	s->n_sinks = 0;
 	s->ioctl_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 	if (s->ioctl_fd < 0) return -1;
 	if (s->cfg.ft_enabled && open_ft(s)) {
@@ -155,14 +162,21 @@ int ks_backend_open(struct ks_state *s)
 	if (!s->cfg.ft_enabled && !s->cfg.usteer_enabled) { ks_backend_close(s); return -1; }
 	if (s->cfg.ft_enabled) for (size_t i = 0; i < s->cfg.n_ft_peers; i++) {
 		struct ks_ft_peer *p = &s->cfg.ft_peers[i];
-		char ip[INET_ADDRSTRLEN];
-		p->sink_ready = !local_ipv4(p->peer_ip) && sink_probe(p->peer_ip);
-		if (!p->sink_ready) {
-			inet_ntop(AF_INET, &p->peer_ip, ip, sizeof(ip));
-			ks_log(KS_LOG_WARN, "KDP source queries disabled for %s: TCP/3517 unavailable", ip);
+		size_t j;
+
+		p->sink_ready = false;
+		if (!p->used) continue;
+		for (j = 0; j < s->n_sinks; j++)
+			if (s->sinks[j].addr.s_addr == p->peer_ip.s_addr) break;
+		if (j == s->n_sinks) {
+			struct ks_sink *sink = &s->sinks[s->n_sinks++];
+
+			memset(sink, 0, sizeof(*sink));
+			sink->addr = p->peer_ip;
+			sink->fd = -1;
 		}
 	}
-	s->next_sink_probe_ms = ks_now_ms() + SINK_REPROBE_MS;
+	ks_backend_reprobe(s, ks_now_ms());
 	return 0;
 }
 
@@ -230,26 +244,52 @@ void ks_backend_abi_check(struct ks_state *s)
 
 void ks_backend_reprobe(struct ks_state *s, uint64_t now)
 {
-	size_t i, n;
+	size_t i;
 
-	if (!s->cfg.ft_enabled || now < s->next_sink_probe_ms || !s->cfg.n_ft_peers)
-		return;
-	s->next_sink_probe_ms = now + SINK_REPROBE_MS;
-	for (n = 0; n < s->cfg.n_ft_peers; n++) {
-		bool ready;
-		char ip[INET_ADDRSTRLEN];
+	if (!s->cfg.ft_enabled) return;
+	for (i = 0; i < s->n_sinks; i++) {
+		struct ks_sink *sink = &s->sinks[i];
+		struct sockaddr_in sin;
 
-		i = (s->sink_probe_cursor + n) % s->cfg.n_ft_peers;
-		if (!s->cfg.ft_peers[i].used) continue;
-		s->sink_probe_cursor = (unsigned int) ((i + 1) % s->cfg.n_ft_peers);
-		ready = !local_ipv4(s->cfg.ft_peers[i].peer_ip) &&
-			sink_probe(s->cfg.ft_peers[i].peer_ip);
-		if (ready == s->cfg.ft_peers[i].sink_ready) break;
-		s->cfg.ft_peers[i].sink_ready = ready;
-		inet_ntop(AF_INET, &s->cfg.ft_peers[i].peer_ip, ip, sizeof(ip));
-		ks_log(ready ? KS_LOG_INFO : KS_LOG_WARN,
-		       "KDP source queries %s for %s", ready ? "enabled" : "disabled", ip);
-		break;
+		if (sink->fd >= 0) {
+			struct pollfd pfd = { sink->fd, POLLOUT, 0 };
+			socklen_t len = sizeof(int);
+			int error = 0, rc = poll(&pfd, 1, 0);
+
+			if (rc < 0 && errno == EINTR) continue;
+			if (rc < 0 || (pfd.revents & POLLNVAL)) {
+				sink_result(s, sink, false, now);
+			} else if (pfd.revents & (POLLOUT | POLLERR | POLLHUP)) {
+				bool ready = !getsockopt(sink->fd, SOL_SOCKET, SO_ERROR, &error, &len) &&
+					!error && !local_ipv4(sink->addr);
+
+				sink_result(s, sink, ready, now);
+			} else if (now >= sink->deadline_ms) {
+				sink_result(s, sink, false, now);
+			}
+			continue;
+		}
+		if (now < sink->next_probe_ms) continue;
+		if (local_ipv4(sink->addr)) {
+			sink_result(s, sink, false, now);
+			continue;
+		}
+		sink->fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+		if (sink->fd < 0 || nonblock(sink->fd)) {
+			sink_result(s, sink, false, now);
+			continue;
+		}
+		memset(&sin, 0, sizeof(sin));
+		sin.sin_family = AF_INET;
+		sin.sin_port = htons(3517);
+		sin.sin_addr = sink->addr;
+		if (!connect(sink->fd, (struct sockaddr *) &sin, sizeof(sin))) {
+			sink_result(s, sink, true, now);
+		} else if (errno == EINPROGRESS) {
+			sink->deadline_ms = now + SINK_TIMEOUT_MS;
+		} else {
+			sink_result(s, sink, false, now);
+		}
 	}
 }
 
@@ -307,6 +347,16 @@ static int number(const uint8_t *t, size_t n, int *v)
 	return 0;
 }
 
+static int counter(const uint8_t *t, size_t n, uint64_t *v)
+{
+	if (!n || n > 20) return -1;
+	for (*v = 0; n; n--, t++) {
+		if (*t < '0' || *t > '9') return -1;
+		*v = *v * 10 + (uint64_t) (*t - '0');
+	}
+	return 0;
+}
+
 /*
  * get_mac_table text: a header naming the columns, then one row per
  * associated station starting with its MAC, the MediaTek BSS index in the
@@ -314,15 +364,16 @@ static int number(const uint8_t *t, size_t n, int *v)
  * when no header is recognized.
  */
 static int mac_table_parse(const uint8_t *buf, size_t len, uint8_t (*macs)[6],
-			   int8_t *rssi, size_t cap, size_t *n, int *bss)
+			   int8_t *rssi, uint64_t *rxb, size_t cap, size_t *n, int *bss)
 {
 	size_t off = 0, cnt = 0;
-	int col = -1, rcol = -1, idx = -1;
+	int col = -1, rcol = -1, xcol = -1, idx = -1;
 
 	while (off < len && buf[off]) {
 		const uint8_t *line = buf + off, *t;
 		size_t llen = 0, pos = 0, tlen, k;
 		int ap = -1, r = 0;
+		uint64_t rx = RX_UNKNOWN;
 		uint8_t mac[6];
 
 		while (off < len && buf[off] && buf[off] != '\n') { off++; llen++; }
@@ -334,6 +385,7 @@ static int mac_table_parse(const uint8_t *buf, size_t len, uint8_t (*macs)[6],
 			for (k = 1; (tlen = token(line, llen, &pos, &t)) != 0; k++) {
 				if (tlen == 2 && !memcmp(t, "AP", 2)) col = (int) k;
 				if (tlen == 4 && !memcmp(t, "RSSI", 4)) rcol = (int) k;
+				if (tlen == 3 && !memcmp(t, "RxB", 3)) xcol = (int) k;
 			}
 			if (col < 0) return -3;
 			continue;
@@ -342,12 +394,14 @@ static int mac_table_parse(const uint8_t *buf, size_t len, uint8_t (*macs)[6],
 		for (k = 1; (tlen = token(line, llen, &pos, &t)) != 0; k++) {
 			if ((int) k == col && (number(t, tlen, &ap) || ap < 0)) return -1;
 			if ((int) k == rcol && (number(t, tlen, &r) || r < -100 || r > -1)) r = 0;
+			if ((int) k == xcol && counter(t, tlen, &rx)) rx = RX_UNKNOWN;
 		}
 		if (ap < 0) return -1;
 		if (idx < 0) idx = ap; else if (idx != ap) return -1;
 		for (k = 0; k < cnt; k++) if (ks_mac_equal(macs[k], mac)) return -1;
 		if (cnt == cap) return -1;
 		rssi[cnt] = (int8_t) r;
+		rxb[cnt] = rx;
 		memcpy(macs[cnt++], mac, 6);
 	}
 	if (col < 0) return -3;
@@ -356,7 +410,7 @@ static int mac_table_parse(const uint8_t *buf, size_t len, uint8_t (*macs)[6],
 }
 
 static int mac_table_query(struct ks_state *s, const struct ks_bss *b, uint8_t (*macs)[6],
-			   int8_t *rssi, size_t cap, size_t *n, int *bss)
+			   int8_t *rssi, uint64_t *rxb, size_t cap, size_t *n, int *bss)
 {
 	struct iwreq wrq;
 
@@ -366,13 +420,14 @@ static int mac_table_query(struct ks_state *s, const struct ks_bss *b, uint8_t (
 	/* the driver stops emitting rows once fewer than MAC_TABLE_ROW bytes remain */
 	if (ioctl(s->ioctl_fd, KS_MTK_MAC_TABLE_IOCTL, &wrq) < 0 || !wrq.u.data.length ||
 	    wrq.u.data.length > sizeof(mac_table) - MAC_TABLE_ROW) return -1;
-	return mac_table_parse(mac_table, wrq.u.data.length, macs, rssi, cap, n, bss);
+	return mac_table_parse(mac_table, wrq.u.data.length, macs, rssi, rxb, cap, n, bss);
 }
 
 int ks_backend_reconcile(struct ks_state *s, uint64_t now)
 {
 	uint8_t macs[KS_MAX_STA][6], owner[KS_MAX_STA];
 	int8_t rssi[KS_MAX_STA];
+	uint64_t rxb[KS_MAX_STA];
 	int index[KS_MAX_BSS];
 	size_t i, j, n = 0, added = 0, moved = 0, dropped = 0;
 	char mac[18];
@@ -388,7 +443,7 @@ int ks_backend_reconcile(struct ks_state *s, uint64_t now)
 		index[i] = -1;
 		if (!b->active) continue;
 		rc = priv_listed(s->ioctl_fd, b->ifname, KS_MTK_MAC_TABLE_IOCTL, "get_mac_table");
-		if (!rc) rc = mac_table_query(s, b, macs + n, rssi + n, KS_MAX_STA - n, &cnt, &index[i]);
+		if (!rc) rc = mac_table_query(s, b, macs + n, rssi + n, rxb + n, KS_MAX_STA - n, &cnt, &index[i]);
 		if (rc < -1) {
 			s->reconcile_off = true;
 			ks_log(KS_LOG_WARN, "station reconciliation disabled: %s on %s",
@@ -426,6 +481,8 @@ int ks_backend_reconcile(struct ks_state *s, uint64_t now)
 
 		if (!st) continue;
 		if (rssi[j]) { st->signal[bss] = rssi[j]; st->seen_ms[bss] = now; }
+		if (rxb[j] == RX_UNKNOWN || !st->heard_ms[bss] || st->rx_bytes != rxb[j]) st->heard_ms[bss] = now;
+		st->rx_bytes = rxb[j];
 		if (st->connected && st->bss_index == bss) continue;
 		if (st->connected) moved++; else added++;
 		st->connected = true; st->bss_index = bss; st->connected_ms = now;
@@ -446,6 +503,8 @@ void ks_backend_close(struct ks_state *s)
 	size_t i;
 	for (i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
 		if (*fds[i] >= 0) { close(*fds[i]); *fds[i] = -1; }
+	for (i = 0; i < s->n_sinks; i++) close_fd(&s->sinks[i].fd);
+	s->n_sinks = 0;
 }
 
 static int priv_ioctl(struct ks_state *s, int bss, uint16_t oid, uint8_t *buf, size_t len)
@@ -473,9 +532,16 @@ int ks_backend_ft_query(struct ks_state *s, int bss_index,
 	uint8_t req[KS_KDP_WRAPPER_LEN]; int rc;
 	size_t i;
 	for (i = 0; i < s->cfg.n_ft_peers; i++)
-		if (s->cfg.ft_peers[i].peer_ip.s_addr == correlation && s->cfg.ft_peers[i].sink_ready)
+		if (s->cfg.ft_peers[i].used && s->cfg.ft_peers[i].peer_ip.s_addr == correlation &&
+		    s->cfg.ft_peers[i].sink_ready)
 			break;
-	if (i == s->cfg.n_ft_peers || ks_kdp_build_wrapper(correlation, element, req)) return -1;
+	if (i == s->cfg.n_ft_peers) {
+		for (i = 0; i < s->n_sinks; i++)
+			if (s->sinks[i].addr.s_addr == correlation && s->sinks[i].fd >= 0)
+				return -3;
+		return -2;
+	}
+	if (ks_kdp_build_wrapper(correlation, element, req)) return -1;
 	rc = priv_ioctl(s, bss_index, KS_OID_FT_QUERY, req, sizeof(req));
 	ks_secure_clear(req, sizeof(req)); return rc;
 }
@@ -484,9 +550,18 @@ int ks_backend_ft_insert(struct ks_state *s, int bss_index, struct in_addr sourc
 			 const struct ks_kdp_element *element)
 {
 	uint8_t req[KS_KDP_WRAPPER_LEN]; int rc;
+	const char *more;
+	char mac[18];
+
 	if (!source.s_addr || ks_kdp_build_wrapper(source.s_addr, element, req)) return -1;
 	rc = priv_ioctl(s, bss_index, KS_OID_FT_INSERT, req, sizeof(req));
 	ks_secure_clear(req, sizeof(req));
+	if (rc && bss_index >= 0 && (size_t) bss_index < s->cfg.n_bss &&
+	    (more = ks_log_allow(&s->log_ft_insert, ks_now_ms()))) {
+		ks_mac_format(ks_kdp_sta(element), mac);
+		ks_log(KS_LOG_WARN, "FT key insert failed on %s for %s%s",
+		       s->cfg.bss[bss_index].ifname, mac, more);
+	}
 	return rc;
 }
 
@@ -673,7 +748,7 @@ static void bndstrg_event(struct ks_state *s, int ifindex, const uint8_t *p, siz
 	if (bndstrg_parse(p, len, mac, &rssi)) return;
 	bss = bndstrg_bss(s, p[BNDSTRG_BAND_OFF]); if (bss < 0) return;
 	st = ks_station_get(s, mac, true); if (!st) return;
-	st->signal[bss] = rssi; st->seen_ms[bss] = ks_now_ms();
+	st->signal[bss] = rssi; st->seen_ms[bss] = st->heard_ms[bss] = ks_now_ms();
 	st->seen_2ghz |= s->cfg.bss[bss].band == KS_BAND_2GHZ;
 	st->seen_5ghz |= s->cfg.bss[bss].band == KS_BAND_5GHZ;
 }
@@ -923,11 +998,30 @@ static bool pending_same(const struct ks_kdp_pending *p, int source_bss,
 		ks_mac_equal(p->target_r1kh, target_r1kh);
 }
 
-static int pending_miss(struct ks_state *s, struct ks_kdp_pending *p)
+static void kdp_failure(struct ks_state *s, bool pull, int source_bss,
+			const uint8_t sta[6], const char *reason)
+{
+	enum ks_log_level level = pull ? KS_LOG_WARN : KS_LOG_DEBUG;
+	uint64_t now = ks_now_ms();
+	const char *ifname = "unknown";
+	char mac[18];
+
+	if (level > ks_log_threshold || now < s->next_kdp_log_ms[pull]) return;
+	s->next_kdp_log_ms[pull] = now + 1000;
+	if (source_bss >= 0 && (size_t) source_bss < s->cfg.n_bss)
+		ifname = s->cfg.bss[source_bss].ifname;
+	ks_mac_format(sta, mac);
+	ks_log(level, "KDP %s on %s for %s failed: %s",
+	       pull ? "pull" : "prewarm", ifname, mac, reason);
+}
+
+static int pending_miss(struct ks_state *s, struct ks_kdp_pending *p,
+			const char *reason)
 {
 	struct ks_kdp_pending q;
 	int rc;
 
+	kdp_failure(s, p->rrb_pull, p->source_bss, p->sta, reason);
 	if (!p->rrb_pull) { ks_secure_clear(p, sizeof(*p)); return -1; }
 	memcpy(&q, p, sizeof(q)); ks_secure_clear(p, sizeof(*p));
 	rc = ks_rrb_send_resp(s, q.peer_index, q.source_bss, q.nonce, q.sta, NULL);
@@ -935,12 +1029,53 @@ static int pending_miss(struct ks_state *s, struct ks_kdp_pending *p)
 	return rc;
 }
 
+static int pending_submit(struct ks_state *s, struct ks_kdp_pending *p)
+{
+	struct ks_kdp_element q;
+	struct ks_bss *bss;
+	int rc;
+
+	if (p->source_bss < 0 || (size_t) p->source_bss >= s->cfg.n_bss)
+		return pending_miss(s, p, "source BSS unavailable");
+	bss = &s->cfg.bss[p->source_bss];
+	if (!bss->active || !bss->mtk_kdp || !bss->r0kh_id_len ||
+	    bss->ifindex != p->source_ifindex)
+		return pending_miss(s, p, "source BSS changed before query submission");
+	memset(&q, 0, sizeof(q));
+	memcpy(q.raw, "\xff\xff\x00\xa3\x00\x0e\x2e", 7);
+	memcpy(q.raw + KDP_STA, p->sta, 6);
+	memcpy(q.raw + KDP_R0KH_ID, bss->r0kh_id, bss->r0kh_id_len);
+	q.raw[KDP_R0KH_LEN] = (uint8_t) bss->r0kh_id_len;
+	memcpy(q.raw + KDP_PMKR0NAME, p->pmkr0name, 16);
+	memcpy(q.raw + KDP_R1KH, p->target_r1kh, 6);
+	memcpy(q.raw + KDP_S1KH, p->sta, 6);
+	rc = ks_backend_ft_query(s, p->source_bss, &q, p->correlation);
+	ks_secure_clear(&q, sizeof(q));
+	if (rc == -3) return 0;
+	if (rc)
+		return pending_miss(s, p,
+			    rc == -2 ? "TCP/3517 unavailable" : "driver query submission failed");
+	p->submitted = true;
+	return 0;
+}
+
+void ks_kdp_retry(struct ks_state *s, uint64_t now)
+{
+	size_t i;
+
+	for (i = 0; i < KS_MAX_KDP_PENDING; i++) {
+		struct ks_kdp_pending *p = &s->kdp_pending[i];
+
+		if (p->used && !p->submitted && now < p->deadline_ms)
+			(void) pending_submit(s, p);
+	}
+}
+
 int ks_kdp_pull_request(struct ks_state *s, int source_bss, int peer_index,
 			const uint8_t nonce[16], const uint8_t sta[6],
 			const uint8_t pmkr0name[16])
 {
 	struct ks_kdp_pending *p;
-	struct ks_kdp_element q;
 	struct ks_bss *bss;
 	struct ks_ft_peer *peer;
 	size_t i;
@@ -958,21 +1093,16 @@ int ks_kdp_pull_request(struct ks_state *s, int source_bss, int peer_index,
 		if (p->rrb_pull) {
 			if (!memcmp(p->nonce, nonce, 16) &&
 			    !memcmp(p->pmkr0name, pmkr0name, 16)) return 0;
+			kdp_failure(s, true, source_bss, sta, "conflicting pending request");
 			return ks_rrb_send_resp(s, peer_index, source_bss, nonce, sta, NULL);
 		}
 		ks_secure_clear(p, sizeof(*p));
 	}
 	p = pending_new(s);
-	if (!p)
+	if (!p) {
+		kdp_failure(s, true, source_bss, sta, "pending table full");
 		return ks_rrb_send_resp(s, peer_index, source_bss, nonce, sta, NULL);
-	memset(&q, 0, sizeof(q));
-	memcpy(q.raw, "\xff\xff\x00\xa3\x00\x0e\x2e", 7);
-	memcpy(q.raw + KDP_STA, sta, 6);
-	memcpy(q.raw + KDP_R0KH_ID, bss->r0kh_id, bss->r0kh_id_len);
-	q.raw[KDP_R0KH_LEN] = (uint8_t) bss->r0kh_id_len;
-	memcpy(q.raw + KDP_PMKR0NAME, pmkr0name, 16);
-	memcpy(q.raw + KDP_R1KH, peer->r1kh_id, 6);
-	memcpy(q.raw + KDP_S1KH, sta, 6);
+	}
 	p->rrb_pull = true; p->correlation = peer->peer_ip.s_addr;
 	memcpy(p->nonce, nonce, 16); memcpy(p->sta, sta, 6);
 	memcpy(p->pmkr0name, pmkr0name, 16);
@@ -980,20 +1110,14 @@ int ks_kdp_pull_request(struct ks_state *s, int source_bss, int peer_index,
 	p->source_bss = source_bss; p->source_ifindex = bss->ifindex;
 	p->peer_index = peer_index;
 	p->deadline_ms = ks_now_ms() + s->cfg.kdp_timeout_ms;
-	if (ks_backend_ft_query(s, source_bss, &q, p->correlation)) {
-		ks_log(KS_LOG_WARN, "KDP pull query on %s failed", bss->ifname);
-		ks_secure_clear(p, sizeof(*p)); ks_secure_clear(&q, sizeof(q));
-		return ks_rrb_send_resp(s, peer_index, source_bss, nonce, sta, NULL);
-	}
-	ks_secure_clear(&q, sizeof(q));
-	return 0;
+	return pending_submit(s, p);
 }
 
 int ks_kdp_prewarm_event(struct ks_state *s, int source_bss,
 			 const struct ks_kdp_element *event)
 {
 	size_t i, j;
-	int submitted = 0;
+	int accepted = 0;
 	uint64_t now = ks_now_ms();
 
 	if (!s->cfg.ft_enabled || !s->rrb_key_loaded || source_bss < 0 ||
@@ -1002,7 +1126,6 @@ int ks_kdp_prewarm_event(struct ks_state *s, int source_bss,
 	for (i = 0; i < s->cfg.n_ft_peers; i++) {
 		struct ks_ft_peer *peer = &s->cfg.ft_peers[i];
 		struct ks_kdp_pending *p;
-		struct ks_kdp_element q;
 		bool blocked = false;
 
 		if (!peer->used || !ks_mac_unicast(peer->r1kh_id) ||
@@ -1018,32 +1141,20 @@ int ks_kdp_prewarm_event(struct ks_state *s, int source_bss,
 		if (blocked) continue;
 		p = pending_new(s);
 		if (!p) break;
-		memcpy(&q, event, sizeof(q));
 		if (!s->cfg.bss[source_bss].r0kh_id_len) {
 			ks_secure_clear(p, sizeof(*p));
 			break;
 		}
-		memset(q.raw + KDP_R0KH_ID, 0, KS_MAX_R0KH_ID);
-		memcpy(q.raw + KDP_R0KH_ID, s->cfg.bss[source_bss].r0kh_id,
-		       s->cfg.bss[source_bss].r0kh_id_len);
-		q.raw[KDP_R0KH_LEN] = (uint8_t) s->cfg.bss[source_bss].r0kh_id_len;
-		memset(q.raw + KDP_PMKR0NAME, 0, 16);
-		memcpy(q.raw + KDP_R1KH, peer->r1kh_id, 6);
-		memcpy(q.raw + KDP_S1KH, event->raw + KDP_STA, 6);
 		p->correlation = peer->peer_ip.s_addr;
-		memcpy(p->sta, q.raw + KDP_STA, 6);
+		memcpy(p->sta, event->raw + KDP_STA, 6);
 		memcpy(p->target_r1kh, peer->r1kh_id, 6);
 		p->source_bss = source_bss;
 		p->source_ifindex = s->cfg.bss[source_bss].ifindex;
 		p->peer_index = (int) i;
 		p->deadline_ms = now + s->cfg.kdp_timeout_ms;
-		if (ks_backend_ft_query(s, source_bss, &q, p->correlation)) {
-			ks_secure_clear(p, sizeof(*p));
-			continue;
-		}
-		submitted++;
+		if (!pending_submit(s, p)) accepted++;
 	}
-	return submitted;
+	return accepted;
 }
 
 int ks_kdp_handle_response(struct ks_state *s, int ifindex, uint32_t correlation,
@@ -1058,34 +1169,42 @@ int ks_kdp_handle_response(struct ks_state *s, int ifindex, uint32_t correlation
 		struct ks_kdp_pending q;
 		int peer, rc;
 
-		if (!p->used || p->correlation != correlation || p->source_ifindex != ifindex ||
+		if (!p->used || !p->submitted || p->correlation != correlation ||
 		    now > p->deadline_ms || !ks_mac_equal(p->sta, e + KDP_STA) ||
 		    !ks_mac_equal(p->sta, e + KDP_S1KH) ||
 		    !ks_mac_equal(p->target_r1kh, e + KDP_R1KH)) continue;
-		if (p->rrb_pull && memcmp(p->pmkr0name, e + KDP_PMKR0NAME, 16))
+		if (p->rrb_pull && memcmp(p->pmkr0name, e + KDP_PMKR0NAME, 16)) {
+			p->response_errors |= KDP_RESPONSE_NAME;
 			continue;
+		}
+		if (p->source_ifindex != ifindex) {
+			p->response_errors |= KDP_RESPONSE_INTERFACE;
+			continue;
+		}
 		peer = p->peer_index;
 		if (p->source_bss < 0 || (size_t) p->source_bss >= s->cfg.n_bss)
-			return pending_miss(s, p);
+			return pending_miss(s, p, "source BSS unavailable");
 		if (e[KDP_R0KH_LEN] != s->cfg.bss[p->source_bss].r0kh_id_len ||
 		    memcmp(e + KDP_R0KH_ID, s->cfg.bss[p->source_bss].r0kh_id,
-			   e[KDP_R0KH_LEN]) ||
-		    !ks_mac_equal(e + KDP_R0KH_MAC, s->cfg.bss[p->source_bss].bssid)) {
-			char want[18], got[18];
+			   e[KDP_R0KH_LEN]))
+			return pending_miss(s, p, "driver returned another R0KH-ID");
+		if (!ks_mac_equal(e + KDP_R0KH_MAC, s->cfg.bss[p->source_bss].bssid)) {
+			char want[18], got[18], reason[80];
 
 			ks_mac_format(s->cfg.bss[p->source_bss].bssid, want);
 			ks_mac_format(e + KDP_R0KH_MAC, got);
-			ks_log(KS_LOG_WARN, "KDP %s response on %s selected BSS %s, expected %s",
-			       p->rrb_pull ? "pull" : "prewarm",
-			       s->cfg.bss[p->source_bss].ifname, got, want);
-			return pending_miss(s, p);
+			snprintf(reason, sizeof(reason), "driver selected BSS %s, expected %s", got, want);
+			return pending_miss(s, p, reason);
 		}
 		if (!memcmp(e + KDP_PMKR0NAME, (uint8_t[16]) {0}, 16) ||
 		    !memcmp(e + KDP_PMKR1NAME, (uint8_t[16]) {0}, 16) ||
-		    !memcmp(e + KDP_PMK_R1, (uint8_t[32]) {0}, 32) ||
-		    memcmp(e + KDP_PAIRWISE, ccmp, 4) ||
-		    (memcmp(e + KDP_AKM, ft_sae, 4) && memcmp(e + KDP_AKM, ft_psk, 4)) ||
-		    !ks_get_le32(e + KDP_LIFETIME)) return pending_miss(s, p);
+		    !memcmp(e + KDP_PMK_R1, (uint8_t[32]) {0}, 32))
+			return pending_miss(s, p, "driver returned empty key material");
+		if (memcmp(e + KDP_PAIRWISE, ccmp, 4) ||
+		    (memcmp(e + KDP_AKM, ft_sae, 4) && memcmp(e + KDP_AKM, ft_psk, 4)))
+			return pending_miss(s, p, "unsupported driver cipher or AKM");
+		if (!ks_get_le32(e + KDP_LIFETIME))
+			return pending_miss(s, p, "driver returned zero key lifetime");
 		memcpy(&q, p, sizeof(q)); ks_secure_clear(p, sizeof(*p));
 		rc = q.rrb_pull ?
 			ks_rrb_send_resp(s, peer, q.source_bss, q.nonce, q.sta, response) :
@@ -1101,10 +1220,16 @@ void ks_kdp_expire(struct ks_state *s, uint64_t now)
 	size_t i;
 	for (i = 0; i < KS_MAX_KDP_PENDING; i++)
 		if (s->kdp_pending[i].used && now >= s->kdp_pending[i].deadline_ms) {
-			if (s->kdp_pending[i].rrb_pull)
-				(void) pending_miss(s, &s->kdp_pending[i]);
-			else
-				ks_secure_clear(&s->kdp_pending[i], sizeof(s->kdp_pending[i]));
+			struct ks_kdp_pending *p = &s->kdp_pending[i];
+			const char *reason = "driver response timeout";
+
+			if (!p->submitted)
+				reason = "TCP/3517 readiness check did not complete before deadline";
+			else if (p->response_errors & KDP_RESPONSE_INTERFACE)
+				reason = "no matching response; driver answered on another interface";
+			else if (p->response_errors & KDP_RESPONSE_NAME)
+				reason = "no matching response; driver returned another PMKR0Name";
+			(void) pending_miss(s, p, reason);
 		}
 }
 

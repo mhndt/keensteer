@@ -579,6 +579,18 @@ static int handle_pull_resp(struct ks_state *s, int pi,
 	return rc;
 }
 
+static int rrb_handle(struct ks_state *s, const uint8_t *frame, size_t len, bool no_defer);
+
+static void rrb_drop_log(struct ks_log_limit *limit, const struct ks_rrb_message *m, const char *why)
+{
+	const char *more = ks_log_allow(limit, ks_now_ms());
+	char mac[18];
+
+	if (!more) return;
+	ks_mac_format(m->src, mac);
+	ks_log(KS_LOG_WARN, "RRB from %s: %s%s", mac, why, more);
+}
+
 static int handle_seq_resp(struct ks_state *s, int pi, const struct ks_rrb_message *m)
 {
 	const uint8_t *nonce = NULL, *seq = NULL; size_t i;
@@ -594,13 +606,13 @@ static int handle_seq_resp(struct ks_state *s, int pi, const struct ks_rrb_messa
 		     message_ids(s, pi, m, true))) return -1;
 		memcpy(&q, &s->rrb_pending[i], sizeof(q)); ks_secure_clear(&s->rrb_pending[i], sizeof(s->rrb_pending[i]));
 		seq_reset(&s->cfg.ft_peers[pi], seq, 1);
-		ks_rrb_handle_frame(s, q.frame, q.frame_len);
+		rrb_handle(s, q.frame, q.frame_len, true);
 		ks_secure_clear(&q, sizeof(q)); return 0;
 	}
 	return -1;
 }
 
-int ks_rrb_handle_frame(struct ks_state *s, const uint8_t *frame, size_t len)
+static int rrb_handle(struct ks_state *s, const uint8_t *frame, size_t len, bool no_defer)
 {
 	struct ks_rrb_message m;
 	struct ks_rrb_plain p;
@@ -615,9 +627,15 @@ int ks_rrb_handle_frame(struct ks_state *s, const uint8_t *frame, size_t len)
 	    ks_bss_by_bssid(s, m.dst) < 0) return 0;
 
 	pi = m.subtype == RRB_PULL ? peer_by_pull(s, &m) : peer_by_message(s, &m);
-	if (pi < 0) return 0;
+	if (pi < 0) {
+		rrb_drop_log(&s->log_rrb_peer, &m, "no matching peer");
+		return 0;
+	}
 
-	if (ks_rrb_decrypt(s->rrb_key, &m, &p)) return 0;
+	if (ks_rrb_decrypt(s->rrb_key, &m, &p)) {
+		rrb_drop_log(&s->log_rrb_key, &m, "decrypt failed");
+		return 0;
+	}
 
 	switch (m.subtype) {
 	case RRB_SEQ_REQ:
@@ -637,7 +655,7 @@ int ks_rrb_handle_frame(struct ks_state *s, const uint8_t *frame, size_t len)
 	replay:
 		rc = seq_check(&s->cfg.ft_peers[pi], seq);
 		if (rc == -2) {
-			rc = queue_and_sync(s, pi, &m, frame, len);
+			rc = no_defer ? -1 : queue_and_sync(s, pi, &m, frame, len);
 		} else if (rc == 0) {
 			seq_accept(&s->cfg.ft_peers[pi], seq);
 			if (m.subtype == RRB_PULL)
@@ -654,7 +672,18 @@ int ks_rrb_handle_frame(struct ks_state *s, const uint8_t *frame, size_t len)
 	}
 
 	ks_secure_clear(&p, sizeof(p));
+	if (rc < 0 && ks_log_threshold >= KS_LOG_DEBUG) {
+		char mac[18];
+
+		ks_mac_format(m.src, mac);
+		ks_log(KS_LOG_DEBUG, "RRB from %s: type %u dropped", mac, m.subtype);
+	}
 	return rc;
+}
+
+int ks_rrb_handle_frame(struct ks_state *s, const uint8_t *frame, size_t len)
+{
+	return rrb_handle(s, frame, len, false);
 }
 
 static int send_pull_peer(struct ks_state *s, int target_bss,

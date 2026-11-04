@@ -114,15 +114,20 @@ static int blobmsg_string_to(uint8_t *out, size_t cap, const char *s, size_t *us
 static int add_neighbor_report(struct bb *b, const struct ks_bss *n)
 {
 	uint8_t nested[256];
-	char nr[64];
-	size_t nlen;
+	char mac[18], nr[64];
+	size_t nlen, used;
 	unsigned int phy = n->band == KS_BAND_2GHZ ? 7 : 9;
 
+	ks_mac_format(n->bssid, mac);
 	snprintf(nr, sizeof(nr),
 		 "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
 		 n->bssid[0], n->bssid[1], n->bssid[2], n->bssid[3], n->bssid[4], n->bssid[5],
-		 0x00, 0x00, 0x00, 0x00, n->op_class & 0xff, n->channel & 0xff, phy);
-	if (blobmsg_string_to(nested, sizeof(nested), nr, &nlen)) return -1;
+		 0x0f, 0x00, 0x00, 0x00, n->op_class & 0xff, n->channel & 0xff, phy);
+	if (blobmsg_string_to(nested, sizeof(nested), mac, &nlen) ||
+	    blobmsg_string_to(nested + nlen, sizeof(nested) - nlen, n->ssid, &used)) return -1;
+	nlen += used;
+	if (blobmsg_string_to(nested + nlen, sizeof(nested) - nlen, nr, &used)) return -1;
+	nlen += used;
 	if (nest_start(b, NODE_RRM_NR)) return -1;
 	if (blobmsg(b, BLOBMSG_ARRAY, nested, nlen)) return -1;
 	return nest_end(b);
@@ -140,12 +145,15 @@ static int add_station(struct bb *b, const struct ks_state *s,
 	conn64 = connected ? 0 : (st->connected_ms && now >= st->connected_ms ?
 				  now - st->connected_ms : age64);
 	int32_t age = age64 > INT32_MAX ? INT32_MAX : (int32_t) age64;
+	uint64_t heard = st->heard_ms[bss_index];
+	heard = heard && now >= heard ? now - heard : age64;
+	int32_t seen = heard > INT32_MAX ? INT32_MAX : (int32_t) heard;
 	int32_t last = conn64 > INT32_MAX ? INT32_MAX : (int32_t) conn64;
 	int32_t timeout = (int32_t) s->cfg.station_ttl_ms - age;
 
 	if (timeout <= 0 || nest_start(b, 0)) return timeout <= 0 ? 0 : -1;
 	if (attr(b, STA_ADDR, st->addr, 6) || ai32(b, STA_SIGNAL, st->signal[bss_index]) ||
-	    ai32(b, STA_TIMEOUT, timeout) || ai32(b, STA_SEEN, age) ||
+	    ai32(b, STA_TIMEOUT, timeout) || ai32(b, STA_SEEN, seen) ||
 	    ai8(b, STA_CONNECTED, connected) ||
 	    /* ID 5/i32 is classic last_connected. NG ignores this type. */
 	    ai32(b, STA_CLASSIC_LAST_CONNECTED, last) ||

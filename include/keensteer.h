@@ -76,6 +76,8 @@ struct ks_station {
 	bool seen_2ghz;
 	bool seen_5ghz;
 	uint64_t seen_ms[KS_MAX_BSS];
+	uint64_t heard_ms[KS_MAX_BSS];
+	uint64_t rx_bytes;
 	uint64_t connected_ms;
 };
 
@@ -137,6 +139,8 @@ struct ks_kdp_element {
 struct ks_kdp_pending {
 	bool used;
 	bool rrb_pull;
+	bool submitted;
+	unsigned int response_errors;
 	uint32_t correlation;
 	uint8_t nonce[16];
 	uint8_t sta[6];
@@ -168,12 +172,28 @@ struct ks_pull_pending {
 	uint64_t deadline_ms;
 };
 
+struct ks_sink {
+	struct in_addr addr;
+	int fd;
+	bool ready;
+	bool checked;
+	uint64_t next_probe_ms;
+	uint64_t deadline_ms;
+};
+
+struct ks_log_limit {
+	uint64_t next_ms;
+	unsigned int suppressed;
+};
+
 struct ks_state {
 	struct ks_config cfg;
 	struct ks_station stations[KS_MAX_STA];
 	struct ks_kdp_pending kdp_pending[KS_MAX_KDP_PENDING];
 	struct ks_rrb_pending rrb_pending[KS_MAX_RRB_PENDING];
 	struct ks_pull_pending pull_pending[KS_MAX_RRB_PENDING];
+	struct ks_sink sinks[KS_MAX_FT_PEERS];
+	size_t n_sinks;
 	uint8_t rrb_key[32];
 	bool rrb_key_loaded;
 	uint32_t usteer_id;
@@ -186,12 +206,14 @@ struct ks_state {
 	uint8_t transport_mac[6];
 	uint64_t next_usteer_ms;
 	uint64_t next_load_ms;
-	uint64_t next_sink_probe_ms;
+	uint64_t next_kdp_log_ms[2];
 	uint64_t next_reconcile_ms;
-	unsigned int sink_probe_cursor;
 	bool reconcile_off;
 	bool neighbor_off;
 	bool stop;
+	struct ks_log_limit log_rrb_peer;
+	struct ks_log_limit log_rrb_key;
+	struct ks_log_limit log_ft_insert;
 };
 
 struct ks_rrb_message {
@@ -213,6 +235,7 @@ extern enum ks_log_level ks_log_threshold;
 
 void ks_log(enum ks_log_level level, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
+const char *ks_log_allow(struct ks_log_limit *limit, uint64_t now);
 uint64_t ks_now_ms(void);
 void ks_secure_clear(void *p, size_t len);
 bool ks_mac_parse(const char *s, uint8_t mac[6]);
@@ -271,6 +294,8 @@ int ks_backend_neighbor(struct ks_state *s, int peer_index, int channel, int op_
 int ks_backend_send_rrb(struct ks_state *s, const uint8_t dst[6],
 			const uint8_t *frame, size_t len);
 #ifdef KS_TEST
+extern char ks_test_log[256];
+extern unsigned int ks_test_log_count;
 int ks_mtk_test_bndstrg(const uint8_t *buf, size_t len, uint8_t mac[6],
 			int *signal);
 int ks_mtk_test_wireless(struct ks_state *s, int ifindex,
@@ -305,6 +330,7 @@ int ks_kdp_handle_response(struct ks_state *s, int ifindex,
 			   uint32_t correlation,
 			   const struct ks_kdp_element *response);
 void ks_kdp_expire(struct ks_state *s, uint64_t now);
+void ks_kdp_retry(struct ks_state *s, uint64_t now);
 const uint8_t *ks_kdp_sta(const struct ks_kdp_element *e);
 const uint8_t *ks_kdp_r0kh_id(const struct ks_kdp_element *e, size_t *len);
 const uint8_t *ks_kdp_pmkr0name(const struct ks_kdp_element *e);
