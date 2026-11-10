@@ -367,15 +367,15 @@ static int counter(const uint8_t *t, size_t n, uint64_t *v)
  * when no header is recognized.
  */
 static int mac_table_parse(const uint8_t *buf, size_t len, uint8_t (*macs)[6],
-			   int8_t *rssi, uint64_t *rxb, size_t cap, size_t *n, int *bss)
+			   int8_t *rssi, uint64_t *rxb, uint8_t *mlo, size_t cap, size_t *n, int *bss)
 {
 	size_t off = 0, cnt = 0;
-	int col = -1, rcol = -1, xcol = -1, idx = -1;
+	int col = -1, rcol = -1, xcol = -1, lcol = -1, idx = -1;
 
 	while (off < len && buf[off]) {
 		const uint8_t *line = buf + off, *t;
 		size_t llen = 0, pos = 0, tlen, k;
-		int ap = -1, r = 0;
+		int ap = -1, r = 0, ml = 0;
 		uint64_t rx = RX_UNKNOWN;
 		uint8_t mac[6];
 
@@ -389,6 +389,7 @@ static int mac_table_parse(const uint8_t *buf, size_t len, uint8_t (*macs)[6],
 				if (tlen == 2 && !memcmp(t, "AP", 2)) col = (int) k;
 				if (tlen == 4 && !memcmp(t, "RSSI", 4)) rcol = (int) k;
 				if (tlen == 3 && !memcmp(t, "RxB", 3)) xcol = (int) k;
+				if (tlen == 2 && !memcmp(t, "ML", 2)) lcol = (int) k;
 			}
 			if (col < 0) return -3;
 			continue;
@@ -398,6 +399,7 @@ static int mac_table_parse(const uint8_t *buf, size_t len, uint8_t (*macs)[6],
 			if ((int) k == col && (number(t, tlen, &ap) || ap < 0)) return -1;
 			if ((int) k == rcol && (number(t, tlen, &r) || r < -100 || r > -1)) r = 0;
 			if ((int) k == xcol && counter(t, tlen, &rx)) rx = RX_UNKNOWN;
+			if ((int) k == lcol && number(t, tlen, &ml)) ml = 0;
 		}
 		if (ap < 0) return -1;
 		if (idx < 0) idx = ap; else if (idx != ap) return -1;
@@ -405,6 +407,7 @@ static int mac_table_parse(const uint8_t *buf, size_t len, uint8_t (*macs)[6],
 		if (cnt == cap) return -1;
 		rssi[cnt] = (int8_t) r;
 		rxb[cnt] = rx;
+		mlo[cnt] = ml > 0;
 		memcpy(macs[cnt++], mac, 6);
 	}
 	if (col < 0) return -3;
@@ -413,7 +416,7 @@ static int mac_table_parse(const uint8_t *buf, size_t len, uint8_t (*macs)[6],
 }
 
 static int mac_table_query(struct ks_state *s, const struct ks_bss *b, uint8_t (*macs)[6],
-			   int8_t *rssi, uint64_t *rxb, size_t cap, size_t *n, int *bss)
+			   int8_t *rssi, uint64_t *rxb, uint8_t *mlo, size_t cap, size_t *n, int *bss)
 {
 	struct iwreq wrq;
 
@@ -423,12 +426,12 @@ static int mac_table_query(struct ks_state *s, const struct ks_bss *b, uint8_t (
 	/* the driver stops emitting rows once fewer than MAC_TABLE_ROW bytes remain */
 	if (ioctl(s->ioctl_fd, KS_MTK_MAC_TABLE_IOCTL, &wrq) < 0 || !wrq.u.data.length ||
 	    wrq.u.data.length > sizeof(mac_table) - MAC_TABLE_ROW) return -1;
-	return mac_table_parse(mac_table, wrq.u.data.length, macs, rssi, rxb, cap, n, bss);
+	return mac_table_parse(mac_table, wrq.u.data.length, macs, rssi, rxb, mlo, cap, n, bss);
 }
 
 int ks_backend_reconcile(struct ks_state *s, uint64_t now)
 {
-	uint8_t macs[KS_MAX_STA][6], owner[KS_MAX_STA];
+	uint8_t macs[KS_MAX_STA][6], owner[KS_MAX_STA], mlo[KS_MAX_STA];
 	int8_t rssi[KS_MAX_STA];
 	uint64_t rxb[KS_MAX_STA];
 	int index[KS_MAX_BSS];
@@ -440,13 +443,13 @@ int ks_backend_reconcile(struct ks_state *s, uint64_t now)
 	s->next_reconcile_ms = now + RECONCILE_MS;
 	for (i = 0; i < s->cfg.n_bss; i++) {
 		struct ks_bss *b = &s->cfg.bss[i];
-		size_t cnt = 0;
+		size_t cnt = 0, kept = 0;
 		int rc;
 
 		index[i] = -1;
 		if (!b->active) continue;
 		rc = priv_listed(s->ioctl_fd, b->ifname, KS_MTK_MAC_TABLE_IOCTL, "get_mac_table");
-		if (!rc) rc = mac_table_query(s, b, macs + n, rssi + n, rxb + n, KS_MAX_STA - n, &cnt, &index[i]);
+		if (!rc) rc = mac_table_query(s, b, macs + n, rssi + n, rxb + n, mlo + n, KS_MAX_STA - n, &cnt, &index[i]);
 		if (rc < -1) {
 			s->reconcile_off = true;
 			ks_log(KS_LOG_WARN, "station reconciliation disabled: %s on %s",
@@ -461,10 +464,18 @@ int ks_backend_reconcile(struct ks_state *s, uint64_t now)
 			if (index[j] >= 0 && index[j] == index[i]) return -1;
 		for (j = 0; j < cnt; j++) {
 			size_t k;
-			for (k = 0; k < n; k++) if (ks_mac_equal(macs[k], macs[n + j])) return -1;
-			owner[n + j] = (uint8_t) i;
+			for (k = 0; k < n; k++) if (ks_mac_equal(macs[k], macs[n + j])) break;
+			if (k < n) {
+				if (!mlo[k] || !mlo[n + j]) return -1;
+				continue;
+			}
+			memmove(macs[n + kept], macs[n + j], 6);
+			rssi[n + kept] = rssi[n + j];
+			rxb[n + kept] = rxb[n + j];
+			mlo[n + kept] = mlo[n + j];
+			owner[n + kept++] = (uint8_t) i;
 		}
-		n += cnt;
+		n += kept;
 	}
 	for (i = 0; i < KS_MAX_STA; i++) {
 		struct ks_station *st = &s->stations[i];

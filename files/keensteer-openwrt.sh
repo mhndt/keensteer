@@ -34,6 +34,11 @@ remove_owner()
 	done
 }
 
+wireless_state()
+{
+	uci show wireless | tr ' ' '\n' | sort
+}
+
 [ "$(id -u)" -eq 0 ] || die "must run as root"
 [ -n "${listen_ip:-}" ] || die "listen_ip missing"
 [ -n "${mobility_domain:-}" ] || die "mobility_domain missing"
@@ -42,6 +47,7 @@ remove_owner()
 [ -n "${keenetic_bss:-}" ] || die "keenetic_bss missing"
 [ -n "${interfaces:-}" ] || die "interfaces missing"
 peers=${peers:-}
+peer_key=${peer_key:-$rrb_key}
 networks=
 
 if ! command -v socat >/dev/null 2>&1; then
@@ -54,6 +60,9 @@ if ! command -v socat >/dev/null 2>&1; then
 	fi
 fi
 command -v socat >/dev/null 2>&1 || die "socat is not installed"
+
+pending=$(uci changes wireless)
+before=$(wireless_state)
 
 for entry in $interfaces; do
 	wifi=${entry%%|*}
@@ -86,13 +95,17 @@ for entry in $interfaces; do
 		peer_bssid=${peer%%|*}
 		peer_nasid=${peer#*|}
 		[ "$peer_bssid" = "$bssid" ] && continue
-		replace_entry "$wifi" r0kh "$peer_bssid,$peer_nasid," "$peer_bssid,$peer_nasid,$rrb_key"
-		replace_entry "$wifi" r1kh "$peer_bssid,$peer_bssid," "$peer_bssid,$peer_bssid,$rrb_key"
+		replace_entry "$wifi" r0kh "$peer_bssid,$peer_nasid," "$peer_bssid,$peer_nasid,$peer_key"
+		replace_entry "$wifi" r1kh "$peer_bssid,$peer_bssid," "$peer_bssid,$peer_bssid,$peer_key"
 	done
 done
 
-uci commit wireless
-wifi reload
+if [ -n "$pending" ] || [ "$before" != "$(wireless_state)" ]; then
+	uci commit wireless
+	wifi reload
+else
+	uci revert wireless
+fi
 if uci -q get usteer.@usteer[-1] >/dev/null 2>&1; then
 	for network in $networks; do
 		uci -q get usteer.@usteer[-1].network | grep -qw "$network" ||

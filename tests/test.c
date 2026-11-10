@@ -1578,6 +1578,36 @@ static int test_backend(void)
 	return 0;
 }
 
+static int test_reconcile_mlo(void)
+{
+	struct ks_state s;
+	struct ks_station *st;
+	static char t0[1024], t1[1024];
+	uint8_t m[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 }, p[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x66 };
+	uint64_t now = 5000000;
+
+	sample_state(&s, 2);
+	s.stations[0].used = false;
+	strcpy(s.cfg.bss[0].ifname, "ra0"); strcpy(s.cfg.bss[1].ifname, "rai0");
+	s.ioctl_fd = 1; mock_wext = true;
+	strcpy(mock_table[0].ifname, "ra0"); strcpy(mock_table[1].ifname, "rai0");
+	mock_table[0].text = t0; mock_table[1].text = t1;
+	mock_table[0].error = mock_table[1].error = false; mock_table_len = 0;
+	snprintf(t0, sizeof(t0), "\nMAC AP RSSI RxB ML\n021122334455 0 -45 10 1\n");
+	snprintf(t1, sizeof(t1), "\nMAC AP RSSI RxB ML\n021122334455 8 -50 20 1\n021122334466 8 -60 30 0\n");
+	CHECK(!ks_backend_reconcile(&s, now));
+	st = ks_station_get(&s, m, false);
+	CHECK(st && st->connected && st->bss_index == 0 && st->signal[0] == -45);
+	st = ks_station_get(&s, p, false);
+	CHECK(st && st->connected && st->bss_index == 1 && st->signal[1] == -60);
+
+	s.next_reconcile_ms = 0;
+	snprintf(t1, sizeof(t1), "\nMAC AP RSSI RxB ML\n021122334455 8 -50 20 0\n");
+	CHECK(ks_backend_reconcile(&s, now) < 0);
+	mock_wext = false;
+	return 0;
+}
+
 static int test_reconcile_heard(void)
 {
 	static struct ks_state s;
@@ -1750,6 +1780,41 @@ static int fx_answer_seq(struct ks_state *s, const uint8_t key[32], uint32_t dom
 	    ks_rrb_build(5, fx_peer, fx_local, key, auth, alen, NULL, 0, frame, sizeof(frame), &flen))
 		return -1;
 	return ks_rrb_handle_frame(s, frame, flen);
+}
+
+static int test_rediscover_opclass(void)
+{
+	struct ks_state s;
+	struct ks_bss *b;
+
+	memset(&s, 0, sizeof(s)); ks_config_defaults(&s.cfg);
+	strcpy(s.cfg.transport_if, "lo"); s.cfg.n_bss = 1; b = &s.cfg.bss[0];
+	strcpy(b->ifname, "lo"); strcpy(b->name, "node"); strcpy(b->ssid, "ess");
+	memcpy(b->bssid, (uint8_t[]) { 0x02, 0, 0, 0, 0, 1 }, 6);
+	memcpy(b->r1kh_id, b->bssid, 6); b->channel = 6; b->freq = 2437;
+	b->op_class = 83; b->band = KS_BAND_2GHZ;
+	s.ioctl_fd = 1; mock_wext = true; mock_freq_channel = 6;
+	mock_load_len = 8; mock_load_error = false;
+	memcpy(mock_load, (uint8_t[]) { 0, 1, 6, 2, 0, 0, 12, 0 }, 8);
+	CHECK(!ks_topology_discover(&s) && b->op_class == 83);
+	s.next_load_ms = 0; ks_backend_update_load(&s);
+	CHECK(b->load == 12 && b->op_class == 84);
+
+	ks_test_log_count = 0;
+	CHECK(!ks_topology_discover(&s) && b->op_class == 84);
+	s.next_load_ms = 0; ks_backend_update_load(&s);
+	CHECK(b->op_class == 84 && !ks_test_log_count);
+
+	mock_freq_channel = 3; mock_load[2] = 3; mock_load[3] = 7;
+	CHECK(!ks_topology_discover(&s) && b->channel == 3 && b->op_class == 83);
+	s.next_load_ms = 0; ks_backend_update_load(&s);
+	CHECK(b->op_class == 83 && !ks_test_log_count);
+
+	b->op_class = 0; mock_load[1] = 0;
+	CHECK(!ks_topology_discover(&s) && b->op_class == 81 && b->active);
+
+	mock_wext = false; mock_freq_channel = 44;
+	return 0;
 }
 
 static int test_rrb_resync(void)
@@ -2117,8 +2182,10 @@ int main(void)
 	n++;
 	if (test_backend()) return 1;
 	n++;
+	if (test_reconcile_mlo()) return 1;
 	if (test_reconcile_heard()) return 1;
 	n++;
+	if (test_rediscover_opclass()) return 1;
 	if (test_rrb_resync()) return 1;
 	n++;
 	if (test_rrb_logging()) return 1;

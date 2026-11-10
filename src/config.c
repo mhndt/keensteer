@@ -425,12 +425,13 @@ static int discover_one(int fd, struct ks_bss *b)
 		}
 		if (!new_channel && new_freq) new_channel = channel_from_freq(new_freq);
 		if (new_channel) {
+			if (new_channel != b->channel || !b->op_class)
+				b->op_class = opclass_from_channel(new_channel, b->op_class);
 			b->channel = new_channel;
 			b->freq = new_freq ? new_freq :
 				(new_channel == 14 ? 2484 :
 				 (new_channel <= 14 ? 2407 + 5 * new_channel :
 				  5000 + 5 * new_channel));
-			b->op_class = opclass_from_channel(b->channel, b->op_class);
 		}
 	}
 	if (b->channel >= 1 && b->channel <= 14) b->band = KS_BAND_2GHZ;
